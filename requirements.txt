@@ -1,4 +1,12 @@
 pyTelegramBotAPI
+aiogram
 pandas
 openpyxl
 flask
+python-docx
+python-pptx
+pypdf
+deep_translator
+requests
+pymupdf
+pdf2docx
