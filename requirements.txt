@@ -1,8 +1,6 @@
-pyTelegramBotAPI
-aiogram
-pandas
-openpyxl
+aiogram>=3.0.0
 flask
+openpyxl
 python-docx
 python-pptx
 pypdf
@@ -10,3 +8,4 @@ deep_translator
 requests
 pymupdf
 pdf2docx
+pandas
