@@ -678,7 +678,7 @@ def run_bot_polling():
         dp = Dispatcher(storage=MemoryStorage())
         dp.include_router(router)
         print("🤖 Бот isa_drilling_translator_bot запущен и готов к работе...")
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, handle_signals=False)
 
     asyncio.run(_start())
 
