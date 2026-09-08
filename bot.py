@@ -12,39 +12,14 @@ import uuid
 import hashlib
 import asyncio
 from pathlib import Path
+import threading
+from flask import Flask
 
 import openpyxl
 from docx import Document
 from pptx import Presentation
 from pypdf import PdfReader
-from deep_translator import GoogleTranslator, MyMemoryTranslator
-
-def safe_translate(text, source='en', target='ru'):
-    """
-    Функция перевода с резервными вариантами (fallback).
-    Если Google сбоит или пропускает текст, подключается MyMemory.
-    """
-    if not text or not text.strip():
-        return text
-
-    # 1. Попытка перевести через Google Translate
-    try:
-        translated = GoogleTranslator(source=source, target=target).translate(text)
-        if translated and translated.strip():
-            return translated
-    except Exception as e:
-        print(f"Google Translate сдал сбой: {e}. Переключаюсь на резервный сервис...")
-
-    # 2. Резервный вариант (MyMemory)
-    try:
-        translated = MyMemoryTranslator(source=source, target=target).translate(text)
-        if translated and translated.strip():
-            return translated
-    except Exception as e:
-        print(f"Резервный переводчик тоже выдал ошибку: {e}")
-
-    # Если абсолютно все не сработало, возвращаем исходный текст, чтобы ничего не потерялось
-    return text
+from deep_translator import GoogleTranslator
 
 # Импорты для aiogram v3
 from aiogram import Bot, Dispatcher, F, Router
@@ -77,7 +52,7 @@ except ImportError:
     requests = None
 
 # ==================== КОНФИГУРАЦИЯ БОТА ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8965573915:AAGCvsCZpYnqE50wr05lzxxYFh8AQVYpfBQ")  # <--- Вставьте сюда токен вашего бота
+BOT_TOKEN = "8965573915:AAGCvsCZpYnqE50wr05lzxxYFh8AQVYpfBQ"  # <--- Вставьте сюда токен вашего бота
 DEVELOPER_IDS = {8186927099, 1359780349}  # ID с бесплатным доступом
 STARS_PRICE = 10                          # Стоимость перевода в Telegram Stars
 
@@ -554,7 +529,6 @@ async def cmd_start(message: Message, state: FSMContext):
     if user_id in DEVELOPER_IDS:
         welcome_text += "\n\n👑 Обнаружен ID спец-доступа: для вас все переводы бесплатны!"
 
-    # Отправляем без проблемного Markdown-парсинга, чтобы бот не падал на спецсимволах
     await message.answer(welcome_text, reply_markup=kb)
     await state.set_state(TranslateStates.waiting_for_direction)
 
@@ -564,7 +538,6 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     direction = "en_ru" if callback.data == "dir_en_ru" else "ru_en"
     await state.update_data(direction=direction)
     
-    # Перезагружаем словарь под нужное направление
     global CUSTOM_DICTIONARY
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
     
@@ -592,7 +565,6 @@ async def process_file_document(message: Message, state: FSMContext, bot: Bot):
         await message.answer(f"❌ Неподдерживаемый формат файла ({ext}). Поддерживаются: {', '.join(supported_exts)}")
         return
 
-    # Проверка на спец-доступ (бесплатно) или выставление счета на 10 звезд
     if user_id not in DEVELOPER_IDS:
         try:
             prices = [LabeledPrice(label="Перевод документа (isa_drilling_translator)", amount=STARS_PRICE)]
@@ -604,7 +576,6 @@ async def process_file_document(message: Message, state: FSMContext, bot: Bot):
                 currency="XTR",  # Telegram Stars
                 prices=prices
             )
-            # Сохраняем информацию о файле в состоянии на время оплаты
             file_info = await bot.get_file(document.file_id)
             downloaded_file = await bot.download_file(file_info.file_path)
             
@@ -621,7 +592,6 @@ async def process_file_document(message: Message, state: FSMContext, bot: Bot):
             await message.answer(f"❌ Ошибка создания счета на оплату: {e}")
             return
 
-    # Если это пользователь из белого списка, пропускаем оплату напрямую
     await execute_translation(message, bot, document, direction, state)
 
 
@@ -648,7 +618,6 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
         document_to_send = FSInputFile(output_path)
         await message.answer_document(document_to_send, caption="✅ Готово! Забирайте переведенный файл.")
         
-        # Удаляем временные файлы
         try:
             os.remove(file_path)
             os.remove(output_path)
@@ -678,7 +647,6 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
         document_to_send = FSInputFile(output_path)
         await message.answer_document(document_to_send, caption="👑 Спец-доступ: файл успешно переведен и сохранен!")
         
-        # Очистка
         try:
             os.remove(local_path)
             os.remove(output_path)
@@ -692,18 +660,34 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
     await state.clear()
 
 
-async def main():
+# ==================== FLASK ДЛЯ WEB SERVICE НА RENDER ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+
+def run_bot_polling():
     if BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
         print("⚠️ ВНИМАНИЕ: Вы не указали токен бота в переменной BOT_TOKEN!")
         return
 
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+    async def _start():
+        bot = Bot(token=BOT_TOKEN)
+        dp = Dispatcher(storage=MemoryStorage())
+        dp.include_router(router)
+        print("🤖 Бот isa_drilling_translator_bot запущен и готов к работе...")
+        await dp.start_polling(bot)
 
-    print("🤖 Бот isa_drilling_translator_bot запущен и готов к работе...")
-    await dp.start_polling(bot)
+    asyncio.run(_start())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Запускаем телеграм-бота в фоновом потоке
+    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
+    bot_thread.start()
+
+    # Получаем порт от Render (или 5000 локально) и запускаем Flask на главном потоке
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
