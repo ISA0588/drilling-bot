@@ -513,10 +513,10 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     welcome_text = (
-        "👋 Привет! Я isa_drilling_translator_bot — универсальный переводчик документов "
+        "👋 Привет! Я ISA _drilling_translator_bot — универсальный переводчик документов "
         "для нефтегазовой и инженерной сферы.\n\n"
         "Поддерживаю форматы: Excel (.xlsx, .xls), Word (.docx), PowerPoint (.pptx), "
-        "Text/Markdown (.txt, .md, .csv), PDF (.pdf).\n\n"
+        "Text/Markdown (.txt, .md, .csv), PDF (.pdf). \n\n"
         "Выберите направление перевода:"
     )
     
@@ -544,7 +544,7 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     dir_name = "EN → RU" if direction == "en_ru" else "RU → EN"
     await callback.message.edit_text(
         f"✅ Направление выбрано: {dir_name}.\n\n"
-        "Теперь отправьте мне файл для перевода (документ или таблица)."
+        "Теперь отправьте мне файл для перевода (документ или таблицe). Дальше жди и наберись терпения, время обработки зависит от объма загруженой информации. Спасибо!."
     )
     await state.set_state(TranslateStates.waiting_for_file)
     await callback.answer()
@@ -611,12 +611,12 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
         await message.answer("✅ Оплата прошла успешно, но файл не найден в сессии. Пожалуйста, отправьте файл повторно.")
         return
 
-    await message.answer("✅ Оплата успешно получена! ⭐️ Перевожу документ, потерпите пару секунд...")
+    await message.answer("✅ Оплата успешно получена! ⭐️ Перевожу документ, потерпите пару немного и он скоро будет готов. Если бот не сработал я готов вернуть ваши звездочки.")
     
     try:
         output_path = process_single_file(file_path, direction)
         document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="✅ Готово! Забирайте переведенный файл.")
+        await message.answer_document(document_to_send, caption="✅ Готово! Забирайте переведенный файл и приходи еще.")
         
         try:
             os.remove(file_path)
@@ -645,7 +645,7 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
         output_path = process_single_file(str(local_path), direction)
         
         document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="👑 Спец-доступ: файл успешно переведен и сохранен!")
+        await message.answer_document(document_to_send, caption="👑 Спец-доступ: файл успешно переведен и сохранен! Красавчик что дождался!")
         
         try:
             os.remove(local_path)
