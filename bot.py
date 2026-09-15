@@ -314,8 +314,8 @@ def process_text_smart(text, direction="en_ru"):
     return convert_imperial_to_metric_advanced(clean_text) if direction == "en_ru" else convert_metric_to_imperial_advanced(clean_text)
 
 
-# ==================== ОПТИМИЗИРОВАННЫЙ EXCEL С СОХРАНЕНИЕМ ПРОГРЕССА ====================
-def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int):
+# ==================== ОПТИМИЗИРОВАННЫЙ EXCEL С ПРОГРЕСС-БАРОМ ====================
+def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
     
     total_cells = 0
@@ -328,8 +328,6 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
 
     processed_cells = 0
     last_update_time = 0
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
@@ -355,7 +353,6 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
                     
                     processed_cells += 1
                     
-                    # Обновляем статус плавно, не реже чем раз в 2 секунды (защита от FloodWait)
                     if total_cells > 0 and (time.time() - last_update_time > 2.0 or processed_cells == total_cells):
                         percent = int((processed_cells / total_cells) * 100)
                         bar_filled = "█" * (percent // 10)
@@ -366,8 +363,9 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
                             f"Обработано ячеек: {processed_cells} из {total_cells}"
                         )
                         try:
-                            loop.run_until_complete(
-                                bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id)
+                            asyncio.run_coroutine_threadsafe(
+                                bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+                                main_loop
                             )
                         except Exception:
                             pass
@@ -651,9 +649,10 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
     try:
         ext = os.path.splitext(file_path).lower()
         if ext in ['.xlsx', '.xls']:
+            main_loop = asyncio.get_running_loop()
             output_path = await asyncio.to_thread(
                 process_excel_file_sync_with_progress, 
-                file_path, direction, bot, message.chat.id, status_msg.message_id
+                file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
         else:
             output_path = await asyncio.to_thread(process_single_file, file_path, direction)
@@ -690,9 +689,10 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
 
         ext = os.path.splitext(document.file_name).lower()
         if ext in ['.xlsx', '.xls']:
+            main_loop = asyncio.get_running_loop()
             output_path = await asyncio.to_thread(
                 process_excel_file_sync_with_progress, 
-                str(local_path), direction, bot, message.chat.id, status_msg.message_id
+                str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
         else:
             output_path = await asyncio.to_thread(process_single_file, str(local_path), direction)
