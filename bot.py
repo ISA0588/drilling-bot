@@ -143,18 +143,21 @@ def parse_inch_value(s):
     try:
         if '.' in s and '/' in s and '-' not in s and ' ' not in s:
             parts = s.split('.')
-            if len(parts) == 2 and '/' in parts:
-                return float(parts[0]) + float(parts.split('/')[0]) / float(parts.split('/'))
+            if len(parts) == 2 and '/' in parts[1]:
+                sub_parts = parts[1].split('/')
+                return float(parts[0]) + float(sub_parts[0]) / float(sub_parts[1])
         s_clean = s.replace(',', '.')
         if '-' in s_clean and '/' in s_clean:
             parts = s_clean.split('-')
-            return float(parts[0]) + float(parts.split('/')[0]) / float(parts.split('/'))
+            sub_parts = parts[1].split('/')
+            return float(parts[0]) + float(sub_parts[0]) / float(sub_parts[1])
         elif ' ' in s_clean and '/' in s_clean:
             parts = s_clean.split()
-            return float(parts[0]) + float(parts.split('/')[0]) / float(parts.split('/'))
+            sub_parts = parts[1].split('/')
+            return float(parts[0]) + float(sub_parts[0]) / float(sub_parts[1])
         elif '/' in s_clean:
             parts = s_clean.split('/')
-            return float(parts[0]) / float(parts)
+            return float(parts[0]) / float(parts[1])
         else:
             return float(s_clean)
     except:
@@ -201,7 +204,7 @@ def convert_imperial_to_metric_advanced(text):
             parts = val_part.split('/')
             try:
                 v1 = float(parts[0].strip())
-                v2 = float(parts.strip())
+                v2 = float(parts[1].strip())
                 return f"{full_match} (~{v1*0.7457:.0f}/{v2*0.7457:.0f} кВт)"
             except:
                 pass
@@ -209,7 +212,7 @@ def convert_imperial_to_metric_advanced(text):
             parts = val_part.split('-')
             try:
                 v1 = float(parts[0].strip())
-                v2 = float(parts.strip())
+                v2 = float(parts[1].strip())
                 return f"{full_match} (~{v1*0.7457:.0f}-{v2*0.7457:.0f} кВт)"
             except:
                 pass
@@ -520,7 +523,7 @@ def process_pdf_file(input_file, direction):
 
 
 def process_single_file(file_path, direction):
-    ext = os.path.splitext(file_path).lower()
+    ext = os.path.splitext(file_path)[1].lower()
     if ext in ['.docx']:
         return process_word_file(file_path, direction)
     elif ext == '.pptx':
@@ -591,7 +594,7 @@ async def process_file_document(message: Message, state: FSMContext, bot: Bot):
 
     document = message.document
     file_name = document.file_name
-    ext = os.path.splitext(file_name).lower()
+    ext = os.path.splitext(file_name)[1].lower()
 
     supported_exts = ['.xlsx', '.xls', '.docx', '.pptx', '.txt', '.md', '.csv', '.pdf']
     if ext not in supported_exts:
@@ -647,7 +650,7 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
     status_msg = await message.answer("⏳ Оплата получена! Анализирую структуру файла...")
     
     try:
-        ext = os.path.splitext(file_path).lower()
+        ext = os.path.splitext(file_path)[1].lower()
         if ext in ['.xlsx', '.xls']:
             main_loop = asyncio.get_running_loop()
             output_path = await asyncio.to_thread(
@@ -687,7 +690,7 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
         with open(local_path, "wb") as f:
             f.write(downloaded_file.read())
 
-        ext = os.path.splitext(document.file_name).lower()
+        ext = os.path.splitext(document.file_name)[1].lower()
         if ext in ['.xlsx', '.xls']:
             main_loop = asyncio.get_running_loop()
             output_path = await asyncio.to_thread(
