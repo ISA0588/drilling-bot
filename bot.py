@@ -52,7 +52,7 @@ except ImportError:
     requests = None
 
 # ==================== КОНФИГУРАЦИЯ БОТА ====================
-BOT_TOKEN = "8965573915:AAGCvsCZpYnqE50wr05lzxxYFh8AQVYpfBQ"  # <--- Токен твоего бота
+BOT_TOKEN = "8965573915:AAFBt0Jqwvis3U7eTcs9EUCfsEq2QhnsFZA"  # <--- Токен твоего бота
 DEVELOPER_IDS = {8186927099, 7785086792, 1359780349}  # ID с бесплатным доступом
 STARS_PRICE = 10                          # Стоимость перевода в Telegram Stars
 
