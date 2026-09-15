@@ -570,6 +570,7 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     direction = "en_ru" if callback.data == "dir_en_ru" else "ru_en"
     await state.update_data(direction=direction)
     
+    # Лучше сохранять словарь в state, но пока оставим как у вас
     global CUSTOM_DICTIONARY
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
     
