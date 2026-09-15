@@ -2,7 +2,7 @@
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
 (Excel, Word, PowerPoint, Text, Markdown, PDF) с сохранением всей логики, глоссария, 
 конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
-"""[cite: 5]
+"""
 
 import os
 import re
