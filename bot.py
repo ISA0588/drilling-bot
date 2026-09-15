@@ -2,7 +2,7 @@
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
 (Excel, Word, PowerPoint, Text, Markdown, PDF) с сохранением всей логики, глоссария, 
 конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
-"""
+"""[cite: 5]
 
 import os
 import re
@@ -314,11 +314,10 @@ def process_text_smart(text, direction="en_ru"):
     return convert_imperial_to_metric_advanced(clean_text) if direction == "en_ru" else convert_metric_to_imperial_advanced(clean_text)
 
 
-# ==================== ОПТИМИЗИРОВАННЫЙ EXCEL С ПРОГРЕСС-БАРОМ ====================
-async def process_excel_file_with_progress(input_file, direction, status_msg, bot: Bot, chat_id: int):
+# ==================== ОПТИМИЗИРОВАННЫЙ EXCEL С СОХРАНЕНИЕМ ПРОГРЕССА ====================
+def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int):
     wb = openpyxl.load_workbook(input_file)
     
-    # Считаем общее количество непустых ячейки во всех листиках для красивого прогресса
     total_cells = 0
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
@@ -329,6 +328,8 @@ async def process_excel_file_with_progress(input_file, direction, status_msg, bo
 
     processed_cells = 0
     last_update_time = 0
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
@@ -354,21 +355,23 @@ async def process_excel_file_with_progress(input_file, direction, status_msg, bo
                     
                     processed_cells += 1
                     
-                    # Обновляем прогресс-бар не чаще чем раз в 1.5 секунды, чтобы не словить лимиты Telegram (FloodWait)
-                    if total_cells > 0 and (time.time() - last_update_time > 1.5 or processed_cells == total_cells):
+                    # Обновляем статус плавно, не реже чем раз в 2 секунды (защита от FloodWait)
+                    if total_cells > 0 and (time.time() - last_update_time > 2.0 or processed_cells == total_cells):
                         percent = int((processed_cells / total_cells) * 100)
+                        bar_filled = "█" * (percent // 10)
+                        bar_empty = "░" * (10 - (percent // 10))
+                        progress_text = (
+                            f"⏳ Идет перевод Excel-файла...\n"
+                            f"[{bar_filled}{bar_empty}] {percent}%\n"
+                            f"Обработано ячеек: {processed_cells} из {total_cells}"
+                        )
                         try:
-                            bar_filled = "█" * (percent // 10)
-                            bar_empty = "░" * (10 - (percent // 10))
-                            progress_text = (
-                                f"⏳ Идет перевод Excel-файла...\n"
-                                f"[{bar_filled}{bar_empty}] {percent}%\n"
-                                f"Обработано ячеек: {processed_cells} из {total_cells}"
+                            loop.run_until_complete(
+                                bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id)
                             )
-                            await bot.edit_message_text(progress_text, chat_id=chat_id, message_id=status_msg.message_id)
-                            last_update_time = time.time()
                         except Exception:
                             pass
+                        last_update_time = time.time()
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -570,7 +573,6 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     direction = "en_ru" if callback.data == "dir_en_ru" else "ru_en"
     await state.update_data(direction=direction)
     
-    # Лучше сохранять словарь в state, но пока оставим как у вас
     global CUSTOM_DICTIONARY
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
     
@@ -649,9 +651,12 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
     try:
         ext = os.path.splitext(file_path).lower()
         if ext in ['.xlsx', '.xls']:
-            output_path = await process_excel_file_with_progress(file_path, direction, status_msg, bot, message.chat.id)
+            output_path = await asyncio.to_thread(
+                process_excel_file_sync_with_progress, 
+                file_path, direction, bot, message.chat.id, status_msg.message_id
+            )
         else:
-            output_path = process_single_file(file_path, direction)
+            output_path = await asyncio.to_thread(process_single_file, file_path, direction)
 
         document_to_send = FSInputFile(output_path)
         await message.answer_document(document_to_send, caption="✅ Готово! Забирайте переведенный файл.")
@@ -671,6 +676,8 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
 async def execute_translation(message: Message, bot: Bot, document, direction, state: FSMContext):
     status_msg = await message.answer("⏳ Скачиваю и анализирую файл...")
     
+    local_path = None
+    output_path = None
     try:
         file_info = await bot.get_file(document.file_id)
         downloaded_file = await bot.download_file(file_info.file_path)
@@ -683,21 +690,28 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
 
         ext = os.path.splitext(document.file_name).lower()
         if ext in ['.xlsx', '.xls']:
-            output_path = await process_excel_file_with_progress(str(local_path), direction, status_msg, bot, message.chat.id)
+            output_path = await asyncio.to_thread(
+                process_excel_file_sync_with_progress, 
+                str(local_path), direction, bot, message.chat.id, status_msg.message_id
+            )
         else:
-            output_path = process_single_file(str(local_path), direction)
+            output_path = await asyncio.to_thread(process_single_file, str(local_path), direction)
         
         document_to_send = FSInputFile(output_path)
         await message.answer_document(document_to_send, caption="👑 Файл успешно переведен! Спасибо за ожидание.")
         
         try:
-            os.remove(local_path)
-            os.remove(output_path)
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
             await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
         except:
             pass
             
     except Exception as e:
+        import traceback
+        print("❌ ОШИБКА ПЕРЕВОДА:\n", traceback.format_exc())
         await message.answer(f"❌ Ошибка при переводе: {e}")
     
     await state.clear()
