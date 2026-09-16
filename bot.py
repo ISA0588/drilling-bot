@@ -323,24 +323,30 @@ def process_text_smart(text, direction="en_ru"):
     # 4. Онлайн-перевод: полностью заменяем текст на русский перевод без дублирования исходного текста
     result = None
     try:
-        src = 'auto' if direction == "en_zh_ru" else ('en' if direction == "en_ru" else 'ru')
-        tgt = 'ru' if direction in ["en_ru", "en_zh_ru"] else 'en'
-        result = GoogleTranslator(source=src, target=tgt).translate(clean_text)
+        if direction == "en_zh_ru":
+            result = GoogleTranslator(source='auto', target='ru').translate(clean_text)
+        elif direction == "en_ru":
+            result = GoogleTranslator(source='en', target='ru').translate(clean_text)
+        else:
+            result = GoogleTranslator(source='ru', target='en').translate(clean_text)
     except Exception:
         pass
 
     # Попытка 2: MyMemory Translator
     if not result or not result.strip():
         try:
-            m_source = 'en' if direction in ['en_ru', 'en_zh_ru'] else 'ru'
-            m_target = 'ru' if direction in ['en_ru', 'en_zh_ru'] else 'en'
-            result = MyMemoryTranslator(source=m_source, target=m_target).translate(clean_text)
+            m_source = 'en' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
+            m_trans = MyMemoryTranslator(source=m_source, target='ru' if direction in ['en_ru', 'en_zh_ru'] else 'en')
+            result = m_trans.translate(clean_text)
         except Exception:
             pass
 
     # Попытка 3: Локальный Ollama
     if not result or not result.strip():
         result = translate_via_ollama(clean_text, direction)
+
+    # ВАЖНО: Защитная микропауза, чтобы предотвратить лимиты и баны Google Translate
+    time.sleep(0.3)
 
     if result and result.strip():
         clean_result = result.strip()
@@ -641,7 +647,7 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
     
     if direction == "en_zh_ru":
-        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
+        dir_name = "EN/ZH (Англ+Кит) → RU"
     elif direction == "en_ru":
         dir_name = "EN → RU"
     else:
