@@ -320,11 +320,10 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    # 4. Онлайн-перевод с единым блоком для EN/ZH -> RU (без накопления дублирующихся строк)
+    # 4. Онлайн-перевод: полностью заменяем текст на русский перевод без дублирования исходного текста
     result = None
     try:
         if direction == "en_zh_ru":
-            # Переводим ячейку/текстовый блок целиком одним запросом, чтобы получить чистый связный русский текст без мусора
             result = GoogleTranslator(source='auto', target='ru').translate(clean_text)
         elif direction == "en_ru":
             result = GoogleTranslator(source='en', target='ru').translate(clean_text)
@@ -387,6 +386,9 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
 
         for row in sheet.iter_rows():
             for cell in row:
+                # Включаем автоматический перенос текста (Wrap Text) для красивого отображения многострочных описаний
+                cell.alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
+                
                 if cell.value is not None and len(str(cell.value).strip()) > 0:
                     orig = str(cell.value)
                     trans = process_text_smart(orig, direction)
