@@ -323,21 +323,18 @@ def process_text_smart(text, direction="en_ru"):
     # 4. Онлайн-перевод: полностью заменяем текст на русский перевод без дублирования исходного текста
     result = None
     try:
-        if direction == "en_zh_ru":
-            result = GoogleTranslator(source='auto', target='ru').translate(clean_text)
-        elif direction == "en_ru":
-            result = GoogleTranslator(source='en', target='ru').translate(clean_text)
-        else:
-            result = GoogleTranslator(source='ru', target='en').translate(clean_text)
+        src = 'auto' if direction == "en_zh_ru" else ('en' if direction == "en_ru" else 'ru')
+        tgt = 'ru' if direction in ["en_ru", "en_zh_ru"] else 'en'
+        result = GoogleTranslator(source=src, target=tgt).translate(clean_text)
     except Exception:
         pass
 
     # Попытка 2: MyMemory Translator
     if not result or not result.strip():
         try:
-            m_source = 'en' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
-            m_trans = MyMemoryTranslator(source=m_source, target='ru' if direction in ['en_ru', 'en_zh_ru'] else 'en')
-            result = m_trans.translate(clean_text)
+            m_source = 'en' if direction in ['en_ru', 'en_zh_ru'] else 'ru'
+            m_target = 'ru' if direction in ['en_ru', 'en_zh_ru'] else 'en'
+            result = MyMemoryTranslator(source=m_source, target=m_target).translate(clean_text)
         except Exception:
             pass
 
