@@ -320,7 +320,6 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    # 4. Онлайн-перевод: полностью заменяем текст на русский перевод без дублирования исходного текста
     # 4. Онлайн-перевод
     result = None
     try:
@@ -331,11 +330,10 @@ def process_text_smart(text, direction="en_ru"):
         else:
             result = GoogleTranslator(source='ru', target='en').translate(clean_text)
         
-        # Увеличиваем паузу, чтобы избежать блокировок от Google API
-        time.sleep(0.6)
+        # Безопасная пауза во избежание блокировок IP
+        time.sleep(0.5)
         
     except Exception as e:
-        print(f"Ошибка переводчика для текста '{clean_text[:20]}...': {e}")
         result = None
 
     # Попытка 2: MyMemory Translator
@@ -346,10 +344,6 @@ def process_text_smart(text, direction="en_ru"):
             result = m_trans.translate(clean_text)
         except Exception:
             pass
-
-    # Попытка 3: Локальный Ollama
-    if not result or not result.strip():
-        result = translate_via_ollama(clean_text, direction)
 
     if result and result.strip():
         clean_result = result.strip()
@@ -392,7 +386,6 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
 
         for row in sheet.iter_rows():
             for cell in row:
-                # Включаем автоматический перенос текста (Wrap Text) для красивого отображения многострочных описаний
                 cell.alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
                 
                 if cell.value is not None and len(str(cell.value).strip()) > 0:
