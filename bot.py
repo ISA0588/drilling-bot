@@ -70,7 +70,6 @@ def init_translator(direction="en_ru"):
     if direction == "en_ru":
         return GoogleTranslator(source='en', target='ru')
     elif direction == "en_zh_ru":
-        # Автоопределение для смеси английского и китайского с выводом на русский
         return GoogleTranslator(source='auto', target='ru')
     else:
         return GoogleTranslator(source='ru', target='en')
@@ -121,7 +120,7 @@ def translate_via_ollama(text, direction="en_ru"):
     try:
         url = "http://localhost:11434/api/generate"
         if direction == "en_zh_ru":
-            prompt = f"Translate the following mixed English and Chinese technical text into accurate Russian. Keep technical terms precise. Return only translation:\n\n{text}"
+            prompt = f"Translate the following mixed English and Chinese technical text into accurate Russian. Keep technical terms precise. Return only clean Russian translation without original text:\n\n{text}"
         elif direction == "en_ru":
             prompt = f"Translate the following technical text from English to Russian accurately. Keep technical terms precise. Return only translation:\n\n{text}"
         else:
@@ -321,29 +320,12 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    # 4. Каскадный онлайн-перевод с поддержкой многострочных блоков и дедупликацией для EN/ZH -> RU
+    # 4. Онлайн-перевод с единым блоком для EN/ZH -> RU (без накопления дублирующихся строк)
     result = None
     try:
         if direction == "en_zh_ru":
-            lines = clean_text.split('\n')
-            translated_lines = []
-            seen_translations = set()
-            for line in lines:
-                if line.strip():
-                    t_line = GoogleTranslator(source='auto', target='ru').translate(line)
-                    if t_line:
-                        # Нормализация для дедупликации (приведение к нижнему регистру без знаков препинания)
-                        norm_t = re.sub(r'[^\w\s]', '', t_line.lower()).strip()
-                        if norm_t and norm_t not in seen_translations:
-                            seen_translations.add(norm_t)
-                            translated_lines.append(t_line)
-                        elif not norm_t:
-                            translated_lines.append(t_line)
-                    else:
-                        translated_lines.append(line)
-                else:
-                    translated_lines.append("")
-            result = "\n".join([l for l in translated_lines if l])
+            # Переводим ячейку/текстовый блок целиком одним запросом, чтобы получить чистый связный русский текст без мусора
+            result = GoogleTranslator(source='auto', target='ru').translate(clean_text)
         elif direction == "en_ru":
             result = GoogleTranslator(source='en', target='ru').translate(clean_text)
         else:
@@ -660,7 +642,7 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
     
     if direction == "en_zh_ru":
-        dir_name = "EN/ZH (Англ+Кит) → RU"
+        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
     elif direction == "en_ru":
         dir_name = "EN → RU"
     else:
