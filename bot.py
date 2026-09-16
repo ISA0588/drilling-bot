@@ -1,6 +1,6 @@
 """
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
-(Excel, Word, PowerPoint, Text, Markdown, PDF) с пакетным батчингом текста, 
+(Excel, Word, PowerPoint, Text, Markdown, PDF) с надежным пакетным переводом через gtx API, 
 сохранением глоссария, конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
 """
 
@@ -14,12 +14,14 @@ import asyncio
 from pathlib import Path
 import threading
 from flask import Flask
+import urllib.request
+import urllib.parse
+import json
 
 import openpyxl
 from docx import Document
 from pptx import Presentation
 from pypdf import PdfReader
-from deep_translator import GoogleTranslator, MyMemoryTranslator
 
 # Импорты для aiogram v3
 from aiogram import Bot, Dispatcher, F, Router
@@ -64,15 +66,6 @@ TRANSLATION_CACHE = {}
 class TranslateStates(StatesGroup):
     waiting_for_direction = State()
     waiting_for_file = State()
-
-
-def init_translator(direction="en_ru"):
-    if direction == "en_ru":
-        return GoogleTranslator(source='en', target='ru')
-    elif direction == "en_zh_ru":
-        return GoogleTranslator(source='auto', target='ru')
-    else:
-        return GoogleTranslator(source='ru', target='en')
 
 
 def load_custom_dictionary(direction="en_ru"):
@@ -316,26 +309,19 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
+    # Одиночный перевод через gtx API
     result = None
     try:
-        if direction == "en_zh_ru":
-            result = GoogleTranslator(source='auto', target='ru').translate(clean_text)
-        elif direction == "en_ru":
-            result = GoogleTranslator(source='en', target='ru').translate(clean_text)
-        else:
-            result = GoogleTranslator(source='ru', target='en').translate(clean_text)
-        
-        time.sleep(0.2)
+        src_lang = 'auto' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
+        tgt_lang = 'ru' if direction in ['en_ru', 'en_zh_ru'] else 'en'
+        encoded_text = urllib.parse.quote(clean_text)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            result = "".join([item[0] for item in res_data[0] if item[0]])
     except Exception:
         result = None
-
-    if not result or not result.strip():
-        try:
-            m_source = 'en' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
-            m_trans = MyMemoryTranslator(source=m_source, target='ru' if direction in ['en_ru', 'en_zh_ru'] else 'en')
-            result = m_trans.translate(clean_text)
-        except Exception:
-            pass
 
     if not result or not result.strip():
         result = translate_via_ollama(clean_text, direction)
@@ -350,9 +336,9 @@ def process_text_smart(text, direction="en_ru"):
     return apply_units(clean_text)
 
 
-# ==================== ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ДЛЯ УСКОРЕНИЯ ====================
+# ==================== НАДЕЖНЫЙ ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ЧЕРЕЗ GTX API ====================
 def batch_translate_texts(texts_list, direction="en_ru"):
-    """Переводит список строк пачкой через GoogleTranslator с разбивкой по батчам, чтобы не ловить лимиты"""
+    """Надежный пакетный перевод строк через прямой запрос к публичному API Google Translate"""
     if not texts_list:
         return []
     
@@ -360,7 +346,6 @@ def batch_translate_texts(texts_list, direction="en_ru"):
     uncached_indices = []
     uncached_texts = []
 
-    # Сначала проверяем кэш и словарь для каждой фразы
     for i, text in enumerate(texts_list):
         if not isinstance(text, str) or not text.strip():
             results[i] = text
@@ -370,7 +355,7 @@ def batch_translate_texts(texts_list, direction="en_ru"):
         lower_clean = clean_text.lower()
         normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
         
-        # Проверяем словарь
+        # Проверка словаря
         found = False
         for k in [normalized_key, lower_clean]:
             if k in CUSTOM_DICTIONARY:
@@ -383,7 +368,7 @@ def batch_translate_texts(texts_list, direction="en_ru"):
         if found:
             continue
 
-        # Проверяем кэш
+        # Проверка кэша
         cache_key = f"{direction}_{normalized_key}"
         if cache_key in TRANSLATION_CACHE:
             results[i] = TRANSLATION_CACHE[cache_key]
@@ -395,43 +380,36 @@ def batch_translate_texts(texts_list, direction="en_ru"):
     if not uncached_texts:
         return results
 
-    # Отправляем пачками по 15 штук
-    batch_size = 15
     src_lang = 'auto' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
     tgt_lang = 'ru' if direction in ['en_ru', 'en_zh_ru'] else 'en'
     
-    translator = GoogleTranslator(source=src_lang, target=tgt_lang)
-
+    batch_size = 10
     for start_idx in range(0, len(uncached_texts), batch_size):
         chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
         chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
         
-        try:
-            # Пытаемся перевести батч целиком
-            translated_chunk = translator.translate_batch(chunk_texts)
-            if translated_chunk and len(translated_chunk) == len(chunk_texts):
-                for idx_in_chunk, translated_val in enumerate(translated_chunk):
-                    orig_idx = chunk_indices[idx_in_chunk]
-                    if translated_val and translated_val.strip():
-                        clean_res = translated_val.strip()
+        for idx_in_chunk, single_text in enumerate(chunk_texts):
+            orig_idx = chunk_indices[idx_in_chunk]
+            try:
+                encoded_text = urllib.parse.quote(single_text)
+                url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    res_data = json.loads(response.read().decode('utf-8'))
+                    translated_sentence = "".join([item[0] for item in res_data[0] if item[0]])
+                    
+                    if translated_sentence.strip():
+                        clean_res = translated_sentence.strip()
                         results[orig_idx] = clean_res
-                        # Сохраняем в кэш
-                        orig_text = uncached_texts[start_idx + idx_in_chunk]
-                        norm_k = re.sub(r'[^\w\s]', '', orig_text.lower()).strip()
+                        norm_k = re.sub(r'[^\w\s]', '', single_text.lower()).strip()
                         TRANSLATION_CACHE[f"{direction}_{norm_k}"] = clean_res
                     else:
-                        results[orig_idx] = uncached_texts[start_idx + idx_in_chunk]
-            else:
-                raise Exception("Batch empty")
-        except Exception:
-            # Запасной вариант: переводим по одному, если батч отклонен
-            for idx_in_chunk, single_text in enumerate(chunk_texts):
-                orig_idx = chunk_indices[idx_in_chunk]
-                results[orig_idx] = process_text_smart(single_text, direction)
-        
-        time.sleep(0.3)
+                        results[orig_idx] = single_text
+            except Exception:
+                results[orig_idx] = single_text
+                
+        time.sleep(0.1)
 
-    # Применяем конвертацию единиц измерения к результатам
     final_results = []
     for i, res in enumerate(results):
         if res is not None:
@@ -445,11 +423,10 @@ def batch_translate_texts(texts_list, direction="en_ru"):
     return final_results
 
 
-# ==================== ОПТИМИЗИРОВАННЫЙ EXCEL С ПАКЕТНЫМ ПЕРЕВОДОМ ====================
+# ==================== ОБРАБОТКА EXCEL ====================
 def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
     
-    # Собираем все ячейки для пакетной обработки
     cells_to_process = []
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
@@ -459,11 +436,10 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
                     cells_to_process.append((cell, str(cell.value)))
 
     total_cells = len(cells_to_process)
-    batch_size = 50
+    batch_size = 40
     processed_count = 0
     last_update_time = 0
 
-    # Переводим заголовки листов
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
         translated_name = process_text_smart(sheet_name, direction)
@@ -477,7 +453,6 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
                     counter += 1
                 sheet.title = final_name
 
-    # Пакетный перевод содержимого ячеек
     for i in range(0, total_cells, batch_size):
         batch = cells_to_process[i:i + batch_size]
         texts = [item[1] for item in batch]
@@ -515,6 +490,7 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
     return output_path
 
 
+# ==================== ОБРАБОТКА WORD ====================
 def process_word_file(input_file, direction):
     doc = Document(input_file)
     paragraphs_to_translate = [p for p in doc.paragraphs if p.text.strip()]
@@ -572,6 +548,7 @@ def translate_word_document_in_place(doc, direction):
                     cell.text = trans
 
 
+# ==================== ОБРАБОТКА POWERPOINT ====================
 def process_pptx_file(input_file, direction):
     prs = Presentation(input_file)
     for slide in prs.slides:
@@ -599,6 +576,7 @@ def process_pptx_file(input_file, direction):
     return output_path
 
 
+# ==================== ОБРАБОТКА ТЕКСТОВЫХ ФАЙЛОВ ====================
 def process_text_document_file(input_file, direction):
     with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
@@ -625,6 +603,7 @@ def process_text_document_file(input_file, direction):
     return output_path
 
 
+# ==================== ОБРАБОТКА PDF ====================
 def process_pdf_file(input_file, direction):
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -819,7 +798,7 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
             output_path = await asyncio.to_thread(process_single_file, file_path, direction)
 
         document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="✅ Готово! Файл уже у вас. Если снова понадобится помощь — вы знаете, где меня искать! 😎")
+        await message.answer_document(document_to_send, caption="✅ Готово! Файл успешно переведен. Если снова понадобится помощь — обращайтесь! 😎")
         
         try:
             os.remove(file_path)
@@ -834,7 +813,7 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
 
 
 async def execute_translation(message: Message, bot: Bot, document, direction, state: FSMContext):
-    status_msg = await message.answer("⏳ Подождите немного. Скачиваю и анализирую файл...")
+    status_msg = await message.answer("⏳ Скачиваю и анализирую файл...")
     
     local_path = None
     output_path = None
@@ -859,7 +838,7 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
             output_path = await asyncio.to_thread(process_single_file, str(local_path), direction)
         
         document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="👑 Файл успешно переведен! Спасибо за ожидание и терпение 🤝.")
+        await message.answer_document(document_to_send, caption="👑 Файл успешно переведен! Спасибо за ожидание 🤝.")
         
         try:
             if local_path and os.path.exists(local_path):
@@ -887,8 +866,8 @@ def home():
 
 
 def run_bot_polling():
-    if BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
-        print("⚠️ ВНИМАНИЕ: Вы не указали токен бота в переменной BOT_TOKEN!")
+    if BOT_TOKEN == "77":
+        print("⚠️ ВНИМАНИЕ: Укажите актуальный токен бота в переменной BOT_TOKEN!")
         return
 
     async def _start():
