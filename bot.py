@@ -321,20 +321,29 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    # 4. Каскадный онлайн-перевод с поддержкой многострочных блоков (особенно для en_zh_ru)
+    # 4. Каскадный онлайн-перевод с поддержкой многострочных блоков и дедупликацией для EN/ZH -> RU
     result = None
     try:
         if direction == "en_zh_ru":
-            # Разделяем многострочный текст (например, адреса или стандарты с \n), чтобы переводчик не сбоил
             lines = clean_text.split('\n')
             translated_lines = []
+            seen_translations = set()
             for line in lines:
                 if line.strip():
                     t_line = GoogleTranslator(source='auto', target='ru').translate(line)
-                    translated_lines.append(t_line if t_line else line)
+                    if t_line:
+                        # Нормализация для дедупликации (приведение к нижнему регистру без знаков препинания)
+                        norm_t = re.sub(r'[^\w\s]', '', t_line.lower()).strip()
+                        if norm_t and norm_t not in seen_translations:
+                            seen_translations.add(norm_t)
+                            translated_lines.append(t_line)
+                        elif not norm_t:
+                            translated_lines.append(t_line)
+                    else:
+                        translated_lines.append(line)
                 else:
                     translated_lines.append("")
-            result = "\n".join(translated_lines)
+            result = "\n".join([l for l in translated_lines if l])
         elif direction == "en_ru":
             result = GoogleTranslator(source='en', target='ru').translate(clean_text)
         else:
@@ -651,7 +660,7 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
     
     if direction == "en_zh_ru":
-        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
+        dir_name = "EN/ZH (Англ+Кит) → RU"
     elif direction == "en_ru":
         dir_name = "EN → RU"
     else:
