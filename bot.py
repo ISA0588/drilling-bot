@@ -2,7 +2,7 @@
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
 (Excel, Word, PowerPoint, Text, Markdown, PDF) с сохранением всей логики, глоссария, 
 конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
-"""
+"""[cite: 4]
 
 import os
 import re
@@ -329,8 +329,12 @@ def process_text_smart(text, direction="en_ru"):
             result = GoogleTranslator(source='en', target='ru').translate(clean_text)
         else:
             result = GoogleTranslator(source='ru', target='en').translate(clean_text)
-    except Exception:
-        pass
+        
+        # ВАЖНО: Добавьте эту паузу, чтобы защититься от банов переводчика
+        time.sleep(0.3)
+        
+    except Exception as e:
+        result = None
 
     # Попытка 2: MyMemory Translator
     if not result or not result.strip():
@@ -344,9 +348,6 @@ def process_text_smart(text, direction="en_ru"):
     # Попытка 3: Локальный Ollama
     if not result or not result.strip():
         result = translate_via_ollama(clean_text, direction)
-
-    # ВАЖНО: Защитная микропауза, чтобы предотвратить лимиты и баны Google Translate
-    time.sleep(0.3)
 
     if result and result.strip():
         clean_result = result.strip()
@@ -647,7 +648,7 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
     
     if direction == "en_zh_ru":
-        dir_name = "EN/ZH (Англ+Кит) → RU"
+        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
     elif direction == "en_ru":
         dir_name = "EN → RU"
     else:
