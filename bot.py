@@ -1,7 +1,7 @@
 """
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
-(Excel, Word, PowerPoint, Text, Markdown, PDF) с сохранением всей логики, глоссария, 
-конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
+(Excel, Word, PowerPoint, Text, Markdown, PDF) с пакетным батчингом текста, 
+сохранением глоссария, конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
 """
 
 import os
@@ -279,7 +279,6 @@ def process_text_smart(text, direction="en_ru"):
     if not clean_text:
         return text
 
-    # Защита технических стандартов, кодов и чисто цифровых/буквенных шифров
     if re.match(r'^(API|ISO|ГОСТ|ТУ|ANSI|ASME|DIN|EN)\s*[\d\-]+[A-Za-zА-Яа-я]*$', clean_text, re.IGNORECASE):
         return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
 
@@ -295,7 +294,6 @@ def process_text_smart(text, direction="en_ru"):
         else:
             return convert_metric_to_imperial_advanced(val)
 
-    # 1. Прямой поиск по словарю
     for k in [normalized_key, lower_clean]:
         if k in CUSTOM_DICTIONARY:
             translated = CUSTOM_DICTIONARY[k]
@@ -303,7 +301,6 @@ def process_text_smart(text, direction="en_ru"):
                 translated = translated.upper()
             return apply_units(translated)
 
-    # 2. Нечёткий поиск через difflib
     if CUSTOM_DICTIONARY:
         keys_list = list(CUSTOM_DICTIONARY.keys())
         matches = difflib.get_close_matches(normalized_key, keys_list, n=1, cutoff=0.85)
@@ -314,13 +311,11 @@ def process_text_smart(text, direction="en_ru"):
                 translated = translated.upper()
             return apply_units(translated)
 
-    # 3. Проверка кэша переводов
     cache_key = f"{direction}_{normalized_key}"
     if cache_key in TRANSLATION_CACHE:
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    # 4. Онлайн-перевод
     result = None
     try:
         if direction == "en_zh_ru":
@@ -330,13 +325,10 @@ def process_text_smart(text, direction="en_ru"):
         else:
             result = GoogleTranslator(source='ru', target='en').translate(clean_text)
         
-        # Безопасная пауза во избежание блокировок IP
-        time.sleep(0.5)
-        
-    except Exception as e:
+        time.sleep(0.2)
+    except Exception:
         result = None
 
-    # Попытка 2: MyMemory Translator
     if not result or not result.strip():
         try:
             m_source = 'en' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
@@ -344,6 +336,9 @@ def process_text_smart(text, direction="en_ru"):
             result = m_trans.translate(clean_text)
         except Exception:
             pass
+
+    if not result or not result.strip():
+        result = translate_via_ollama(clean_text, direction)
 
     if result and result.strip():
         clean_result = result.strip()
@@ -355,24 +350,122 @@ def process_text_smart(text, direction="en_ru"):
     return apply_units(clean_text)
 
 
-# ==================== ОПТИМИЗИРОВАННЫЙ EXCEL С ПРОГРЕСС-БАРОМ ====================
+# ==================== ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ДЛЯ УСКОРЕНИЯ ====================
+def batch_translate_texts(texts_list, direction="en_ru"):
+    """Переводит список строк пачкой через GoogleTranslator с разбивкой по батчам, чтобы не ловить лимиты"""
+    if not texts_list:
+        return []
+    
+    results = [None] * len(texts_list)
+    uncached_indices = []
+    uncached_texts = []
+
+    # Сначала проверяем кэш и словарь для каждой фразы
+    for i, text in enumerate(texts_list):
+        if not isinstance(text, str) or not text.strip():
+            results[i] = text
+            continue
+        
+        clean_text = text.strip()
+        lower_clean = clean_text.lower()
+        normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
+        
+        # Проверяем словарь
+        found = False
+        for k in [normalized_key, lower_clean]:
+            if k in CUSTOM_DICTIONARY:
+                tr = CUSTOM_DICTIONARY[k]
+                if clean_text.isupper() and len(clean_text) > 1:
+                    tr = tr.upper()
+                results[i] = tr
+                found = True
+                break
+        if found:
+            continue
+
+        # Проверяем кэш
+        cache_key = f"{direction}_{normalized_key}"
+        if cache_key in TRANSLATION_CACHE:
+            results[i] = TRANSLATION_CACHE[cache_key]
+            continue
+
+        uncached_indices.append(i)
+        uncached_texts.append(clean_text)
+
+    if not uncached_texts:
+        return results
+
+    # Отправляем пачками по 15 штук
+    batch_size = 15
+    src_lang = 'auto' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
+    tgt_lang = 'ru' if direction in ['en_ru', 'en_zh_ru'] else 'en'
+    
+    translator = GoogleTranslator(source=src_lang, target=tgt_lang)
+
+    for start_idx in range(0, len(uncached_texts), batch_size):
+        chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
+        chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
+        
+        try:
+            # Пытаемся перевести батч целиком
+            translated_chunk = translator.translate_batch(chunk_texts)
+            if translated_chunk and len(translated_chunk) == len(chunk_texts):
+                for idx_in_chunk, translated_val in enumerate(translated_chunk):
+                    orig_idx = chunk_indices[idx_in_chunk]
+                    if translated_val and translated_val.strip():
+                        clean_res = translated_val.strip()
+                        results[orig_idx] = clean_res
+                        # Сохраняем в кэш
+                        orig_text = uncached_texts[start_idx + idx_in_chunk]
+                        norm_k = re.sub(r'[^\w\s]', '', orig_text.lower()).strip()
+                        TRANSLATION_CACHE[f"{direction}_{norm_k}"] = clean_res
+                    else:
+                        results[orig_idx] = uncached_texts[start_idx + idx_in_chunk]
+            else:
+                raise Exception("Batch empty")
+        except Exception:
+            # Запасной вариант: переводим по одному, если батч отклонен
+            for idx_in_chunk, single_text in enumerate(chunk_texts):
+                orig_idx = chunk_indices[idx_in_chunk]
+                results[orig_idx] = process_text_smart(single_text, direction)
+        
+        time.sleep(0.3)
+
+    # Применяем конвертацию единиц измерения к результатам
+    final_results = []
+    for i, res in enumerate(results):
+        if res is not None:
+            if direction in ["en_ru", "en_zh_ru"]:
+                final_results.append(convert_imperial_to_metric_advanced(res))
+            else:
+                final_results.append(convert_metric_to_imperial_advanced(res))
+        else:
+            final_results.append(texts_list[i])
+            
+    return final_results
+
+
+# ==================== ОПТИМИЗИРОВАННЫЙ EXCEL С ПАКЕТНЫМ ПЕРЕВОДОМ ====================
 def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
     
-    total_cells = 0
+    # Собираем все ячейки для пакетной обработки
+    cells_to_process = []
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
         for row in sheet.iter_rows():
             for cell in row:
                 if cell.value is not None and len(str(cell.value).strip()) > 0:
-                    total_cells += 1
+                    cells_to_process.append((cell, str(cell.value)))
 
-    processed_cells = 0
+    total_cells = len(cells_to_process)
+    batch_size = 50
+    processed_count = 0
     last_update_time = 0
 
+    # Переводим заголовки листов
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
-        
         translated_name = process_text_smart(sheet_name, direction)
         if translated_name and translated_name != sheet_name:
             clean = ''.join([c for c in translated_name if c not in r'\/?*:[ ]'])[:31].strip()
@@ -384,44 +477,39 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
                     counter += 1
                 sheet.title = final_name
 
-        for row in sheet.iter_rows():
-            for cell in row:
-                cell.alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
-                
-                if cell.value is not None and len(str(cell.value).strip()) > 0:
-                    orig = str(cell.value)
-                    trans = process_text_smart(orig, direction)
-                    if trans and trans != orig:
-                        cell.value = trans
-                    
-                    processed_cells += 1
-                    
-                    if total_cells > 0 and (time.time() - last_update_time > 2.0 or processed_cells == total_cells):
-                        percent = int((processed_cells / total_cells) * 100)
-                        bar_filled = "█" * (percent // 10)
-                        bar_empty = "░" * (10 - (percent // 10))
-                        progress_text = (
-                            f"⏳ Идет перевод Excel-файла...\n"
-                            f"[{bar_filled}{bar_empty}] {percent}%\n"
-                            f"Обработано ячеек: {processed_cells} из {total_cells}"
-                        )
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
-                                main_loop
-                            )
-                        except Exception:
-                            pass
-                        last_update_time = time.time()
+    # Пакетный перевод содержимого ячеек
+    for i in range(0, total_cells, batch_size):
+        batch = cells_to_process[i:i + batch_size]
+        texts = [item[1] for item in batch]
+        translated_texts = batch_translate_texts(texts, direction)
+        
+        for (cell, _), trans in zip(batch, translated_texts):
+            cell.alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
+            if trans and trans != cell.value:
+                cell.value = trans
+            processed_count += 1
+
+        if total_cells > 0 and (time.time() - last_update_time > 2.0 or processed_count == total_cells):
+            percent = int((processed_count / total_cells) * 100)
+            bar_filled = "█" * (percent // 10)
+            bar_empty = "░" * (10 - (percent // 10))
+            progress_text = (
+                f"⏳ Идет пакетный перевод Excel...\n"
+                f"[{bar_filled}{bar_empty}] {percent}%\n"
+                f"Обработано ячеек: {processed_count} из {total_cells}"
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+                    main_loop
+                )
+            except Exception:
+                pass
+            last_update_time = time.time()
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    if direction == "en_zh_ru":
-        suffix = "_EN_ZH_RU"
-    elif direction == "en_ru":
-        suffix = "_RU"
-    else:
-        suffix = "_EN"
+    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     wb.save(output_path)
     return output_path
@@ -429,51 +517,59 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
 
 def process_word_file(input_file, direction):
     doc = Document(input_file)
-    for p in doc.paragraphs:
-        if p.text.strip():
-            orig = p.text
-            trans = process_text_smart(orig, direction)
-            if trans and trans != orig:
+    paragraphs_to_translate = [p for p in doc.paragraphs if p.text.strip()]
+    p_texts = [p.text for p in paragraphs_to_translate]
+    
+    if p_texts:
+        translated_p_texts = batch_translate_texts(p_texts, direction)
+        for p, trans in zip(paragraphs_to_translate, translated_p_texts):
+            if trans and trans != p.text:
                 p.text = trans
 
     for table in doc.tables:
+        cells_list = []
+        c_texts = []
         for row in table.rows:
             for cell in row.cells:
                 if cell.text.strip():
-                    orig = cell.text
-                    trans = process_text_smart(orig, direction)
-                    if trans and trans != orig:
-                        cell.text = trans
+                    cells_list.append(cell)
+                    c_texts.append(cell.text)
+        if c_texts:
+            translated_c_texts = batch_translate_texts(c_texts, direction)
+            for cell, trans in zip(cells_list, translated_c_texts):
+                if trans and trans != cell.text:
+                    cell.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    if direction == "en_zh_ru":
-        suffix = "_EN_ZH_RU"
-    elif direction == "en_ru":
-        suffix = "_RU"
-    else:
-        suffix = "_EN"
+    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     doc.save(output_path)
     return output_path
 
 
 def translate_word_document_in_place(doc, direction):
-    for p in doc.paragraphs:
-        if p.text.strip():
-            orig = p.text
-            trans = process_text_smart(orig, direction)
-            if trans and trans != orig:
+    paragraphs_to_translate = [p for p in doc.paragraphs if p.text.strip()]
+    p_texts = [p.text for p in paragraphs_to_translate]
+    if p_texts:
+        translated_p_texts = batch_translate_texts(p_texts, direction)
+        for p, trans in zip(paragraphs_to_translate, translated_p_texts):
+            if trans and trans != p.text:
                 p.text = trans
 
     for table in doc.tables:
+        cells_list = []
+        c_texts = []
         for row in table.rows:
             for cell in row.cells:
                 if cell.text.strip():
-                    orig = cell.text
-                    trans = process_text_smart(orig, direction)
-                    if trans and trans != orig:
-                        cell.text = trans
+                    cells_list.append(cell)
+                    c_texts.append(cell.text)
+        if c_texts:
+            translated_c_texts = batch_translate_texts(c_texts, direction)
+            for cell, trans in zip(cells_list, translated_c_texts):
+                if trans and trans != cell.text:
+                    cell.text = trans
 
 
 def process_pptx_file(input_file, direction):
@@ -482,29 +578,22 @@ def process_pptx_file(input_file, direction):
         for shape in slide.shapes:
             if shape.has_text_frame:
                 for paragraph in shape.text_frame.paragraphs:
-                    for run in paragraph.runs:
-                        if run.text.strip():
-                            orig = run.text
-                            trans = process_text_smart(orig, direction)
-                            if trans and trans != orig:
-                                run.text = trans
+                    runs_to_translate = [r for r in paragraph.runs if r.text.strip()]
+                    r_texts = [r.text for r in runs_to_translate]
+                    if r_texts:
+                        translated_r = batch_translate_texts(r_texts, direction)
+                        for r, trans in zip(runs_to_translate, translated_r):
+                            if trans and trans != r.text:
+                                r.text = trans
             elif shape.has_table:
                 for row in shape.table.rows:
                     for cell in row.cells:
                         if cell.text.strip():
-                            orig = cell.text
-                            trans = process_text_smart(orig, direction)
-                            if trans and trans != orig:
-                                cell.text = trans
+                            cell.text = process_text_smart(cell.text, direction)
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    if direction == "en_zh_ru":
-        suffix = "_EN_ZH_RU"
-    elif direction == "en_ru":
-        suffix = "_RU"
-    else:
-        suffix = "_EN"
+    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     prs.save(output_path)
     return output_path
@@ -514,11 +603,12 @@ def process_text_document_file(input_file, direction):
     with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
     
+    stripped_lines = [l.strip() for l in lines]
+    translated_stripped = batch_translate_texts(stripped_lines, direction)
+    
     translated_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped:
-            trans = process_text_smart(stripped, direction)
+    for line, trans in zip(lines, translated_stripped):
+        if trans and trans.strip():
             prefix = line[:len(line) - len(line.lstrip())]
             suffix = line[len(line.rstrip()):]
             translated_lines.append(prefix + trans + suffix)
@@ -527,12 +617,7 @@ def process_text_document_file(input_file, direction):
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    if direction == "en_zh_ru":
-        suffix = "_EN_ZH_RU"
-    elif direction == "en_ru":
-        suffix = "_RU"
-    else:
-        suffix = "_EN"
+    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
 
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -565,18 +650,20 @@ def process_pdf_file(input_file, direction):
             text = page.get_text("text")
             out_doc.add_heading(f"Страница {idx}", level=2)
             if text:
-                for l in text.split('\n'):
-                    if l.strip():
-                        out_doc.add_paragraph(process_text_smart(l.strip(), direction))
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                trans_lines = batch_translate_texts(lines, direction)
+                for tl in trans_lines:
+                    out_doc.add_paragraph(tl)
     else:
         reader = PdfReader(input_file)
         for idx, page in enumerate(reader.pages, 1):
             text = page.extract_text()
             out_doc.add_heading(f"Страница {idx}", level=2)
             if text:
-                for line in text.split('\n'):
-                    if line.strip():
-                        out_doc.add_paragraph(process_text_smart(line.strip(), direction))
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                trans_lines = batch_translate_texts(lines, direction)
+                for tl in trans_lines:
+                    out_doc.add_paragraph(tl)
 
     out_doc.save(output_path)
     return output_path
