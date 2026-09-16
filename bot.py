@@ -321,6 +321,7 @@ def process_text_smart(text, direction="en_ru"):
         return apply_units(translated)
 
     # 4. Онлайн-перевод: полностью заменяем текст на русский перевод без дублирования исходного текста
+    # 4. Онлайн-перевод
     result = None
     try:
         if direction == "en_zh_ru":
@@ -330,10 +331,11 @@ def process_text_smart(text, direction="en_ru"):
         else:
             result = GoogleTranslator(source='ru', target='en').translate(clean_text)
         
-        # ВАЖНО: Добавьте эту паузу, чтобы защититься от банов переводчика
-        time.sleep(0.3)
+        # Увеличиваем паузу, чтобы избежать блокировок от Google API
+        time.sleep(0.6)
         
     except Exception as e:
+        print(f"Ошибка переводчика для текста '{clean_text[:20]}...': {e}")
         result = None
 
     # Попытка 2: MyMemory Translator
