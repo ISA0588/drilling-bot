@@ -321,29 +321,32 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    # 4. Каскадный онлайн-перевод (Google -> MyMemory -> Ollama)
+    # 4. Каскадный онлайн-перевод с поддержкой многострочных блоков (особенно для en_zh_ru)
     result = None
-    if direction == "en_zh_ru":
-        src_lang = 'auto'
-        tgt_lang = 'ru'
-    elif direction == "en_ru":
-        src_lang = 'en'
-        tgt_lang = 'ru'
-    else:
-        src_lang = 'ru'
-        tgt_lang = 'en'
-
-    # Попытка 1: Google Translator
     try:
-        g_trans = GoogleTranslator(source=src_lang, target=tgt_lang)
-        result = g_trans.translate(clean_text)
+        if direction == "en_zh_ru":
+            # Разделяем многострочный текст (например, адреса или стандарты с \n), чтобы переводчик не сбоил
+            lines = clean_text.split('\n')
+            translated_lines = []
+            for line in lines:
+                if line.strip():
+                    t_line = GoogleTranslator(source='auto', target='ru').translate(line)
+                    translated_lines.append(t_line if t_line else line)
+                else:
+                    translated_lines.append("")
+            result = "\n".join(translated_lines)
+        elif direction == "en_ru":
+            result = GoogleTranslator(source='en', target='ru').translate(clean_text)
+        else:
+            result = GoogleTranslator(source='ru', target='en').translate(clean_text)
     except Exception:
         pass
 
     # Попытка 2: MyMemory Translator
     if not result or not result.strip():
         try:
-            m_trans = MyMemoryTranslator(source='en' if src_lang=='auto' else src_lang, target=tgt_lang)
+            m_source = 'en' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
+            m_trans = MyMemoryTranslator(source=m_source, target='ru' if direction in ['en_ru', 'en_zh_ru'] else 'en')
             result = m_trans.translate(clean_text)
         except Exception:
             pass
