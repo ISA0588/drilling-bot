@@ -18,24 +18,10 @@ import urllib.request
 import urllib.parse
 import json
 
-
 import openpyxl
 from docx import Document
 from pptx import Presentation
 from pypdf import PdfReader
-
-import subprocess
-import os
-
-def convert_doc_to_docx(doc_path):
-    dir_path = os.path.dirname(doc_path) or '.'
-    subprocess.run(
-        ['soffice', '--headless', '--convert-to', 'docx', doc_path, '--outdir', dir_path], 
-        check=True, 
-        stdout=subprocess.DEVNULL, 
-        stderr=subprocess.DEVNULL
-    )
-    return os.path.splitext(doc_path)[0] + '.docx'
 
 # Импорты для aiogram v3
 from aiogram import Bot, Dispatcher, F, Router
@@ -504,23 +490,9 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
     return output_path
 
 
-# ==================== ОБРАБОТКА WORD (DOC / DOCX) ====================
+# ==================== ОБРАБОТКА WORD ====================
 def process_word_file(input_file, direction):
-    ext = os.path.splitext(input_file)[1].lower()
-    
-    is_legacy_doc = (ext == '.doc')
-    actual_input = input_file
-    
-    # Если это старый формат .doc, конвертируем во временный .docx
-    if is_legacy_doc:
-        try:
-            actual_input = convert_doc_to_docx(input_file)
-        except Exception as e:
-            raise RuntimeError(f"Не удалось конвертировать .doc в .docx. Установлен ли LibreOffice? Ошибка: {e}")
-
-    doc = Document(actual_input)
-    
-    # --- Ваш исходный код обработки параграфов ---
+    doc = Document(input_file)
     paragraphs_to_translate = [p for p in doc.paragraphs if p.text.strip()]
     p_texts = [p.text for p in paragraphs_to_translate]
     
@@ -530,7 +502,6 @@ def process_word_file(input_file, direction):
             if trans and trans != p.text:
                 p.text = trans
 
-    # --- Ваш исходный код обработки таблиц ---
     for table in doc.tables:
         cells_list = []
         c_texts = []
@@ -545,24 +516,36 @@ def process_word_file(input_file, direction):
                 if trans and trans != cell.text:
                     cell.text = trans
 
-    # --- Формирование пути для сохранения ---
     dir_path, full_name = os.path.split(input_file)
-    name, _ = os.path.splitext(full_name)
+    name, ext = os.path.splitext(full_name)
     suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
-    
-    # Результат сохраняем в формате .docx (или оригинальном расширении, если был .docx)
-    out_ext = '.docx' if is_legacy_doc else ext
-    output_path = os.path.join(dir_path, f"{name}{suffix}{out_ext}")
+    output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     doc.save(output_path)
-    
-    # Удаляем временный .docx файл, созданный при конвертации .doc
-    if is_legacy_doc and os.path.exists(actual_input):
-        try:
-            os.remove(actual_input)
-        except OSError:
-            pass
-            
     return output_path
+
+
+def translate_word_document_in_place(doc, direction):
+    paragraphs_to_translate = [p for p in doc.paragraphs if p.text.strip()]
+    p_texts = [p.text for p in paragraphs_to_translate]
+    if p_texts:
+        translated_p_texts = batch_translate_texts(p_texts, direction)
+        for p, trans in zip(paragraphs_to_translate, translated_p_texts):
+            if trans and trans != p.text:
+                p.text = trans
+
+    for table in doc.tables:
+        cells_list = []
+        c_texts = []
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    cells_list.append(cell)
+                    c_texts.append(cell.text)
+        if c_texts:
+            translated_c_texts = batch_translate_texts(c_texts, direction)
+            for cell, trans in zip(cells_list, translated_c_texts):
+                if trans and trans != cell.text:
+                    cell.text = trans
 
 
 # ==================== ОБРАБОТКА POWERPOINT ====================
