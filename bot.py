@@ -2,6 +2,7 @@
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
 (Excel, Word, PowerPoint, Text, Markdown, PDF) с надежным пакетным переводом через gtx API, 
 сохранением глоссария, конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
+Поддерживает направления: EN ↔ RU, EN/ZH → RU, RU ↔ AZ.
 """
 
 import os
@@ -56,7 +57,7 @@ except ImportError:
 # ==================== КОНФИГУРАЦИЯ БОТА ====================
 BOT_TOKEN = "8965573915:AAFBt0Jqwvis3U7eTcs9EUCfsEq2QhnsFZA"  # <--- Токен твоего бота
 DEVELOPER_IDS = {8186927099, 1153214776, 7785086792, 1359780349}  # ID с бесплатным доступом
-STARS_PRICE = 10                          # Стоимость перевода в Telegram Stars
+STARS_PRICE = 10                                          # Стоимость перевода в Telegram Stars
 
 # Глобальные переменные состояния
 CUSTOM_DICTIONARY = {}
@@ -80,7 +81,7 @@ def load_custom_dictionary(direction="en_ru"):
                     col1 = str(row[0]).strip()
                     col2 = str(row[1]).strip()
                     if col1 and col2:
-                        if direction in ["en_ru", "en_zh_ru"]:
+                        if direction in ["en_ru", "en_zh_ru", "ru_az"]:
                             custom_dict[col1.lower()] = col2
                         else:
                             custom_dict[col2.lower()] = col1
@@ -116,8 +117,14 @@ def translate_via_ollama(text, direction="en_ru"):
             prompt = f"Translate the following mixed English and Chinese technical text into accurate Russian. Keep technical terms precise. Return only clean Russian translation without original text:\n\n{text}"
         elif direction == "en_ru":
             prompt = f"Translate the following technical text from English to Russian accurately. Keep technical terms precise. Return only translation:\n\n{text}"
-        else:
+        elif direction == "ru_en":
             prompt = f"Translate the following technical text from Russian to English accurately. Keep technical terms precise. Return only translation:\n\n{text}"
+        elif direction == "ru_az":
+            prompt = f"Translate the following technical text from Russian to Azerbaijani accurately. Keep technical terms precise. Return only translation:\n\n{text}"
+        elif direction == "az_ru":
+            prompt = f"Translate the following technical text from Azerbaijani to Russian accurately. Keep technical terms precise. Return only translation:\n\n{text}"
+        else:
+            prompt = f"Translate the following technical text accurately. Keep technical terms precise. Return only translation:\n\n{text}"
         
         payload = {
             "model": "llama3",
@@ -264,6 +271,33 @@ def convert_metric_to_imperial_advanced(text):
     return res
 
 
+def get_lang_codes(direction):
+    """Возвращает кодовую пару языков для API перевода"""
+    if direction == 'en_zh_ru':
+        return 'auto', 'ru'
+    elif direction == 'en_ru':
+        return 'en', 'ru'
+    elif direction == 'ru_en':
+        return 'ru', 'en'
+    elif direction == 'ru_az':
+        return 'ru', 'az'
+    elif direction == 'az_ru':
+        return 'az', 'ru'
+    return 'auto', 'ru'
+
+
+def get_file_suffix(direction):
+    """Возвращает суффикс для сохраняемого переведенного файла"""
+    mapping = {
+        "en_zh_ru": "_EN_ZH_RU",
+        "en_ru": "_RU",
+        "ru_en": "_EN",
+        "ru_az": "_AZ",
+        "az_ru": "_RU"
+    }
+    return mapping.get(direction, "_TRANSLATED")
+
+
 def process_text_smart(text, direction="en_ru"):
     if not isinstance(text, str):
         return text
@@ -273,10 +307,10 @@ def process_text_smart(text, direction="en_ru"):
         return text
 
     if re.match(r'^(API|ISO|ГОСТ|ТУ|ANSI|ASME|DIN|EN)\s*[\d\-]+[A-Za-zА-Яа-я]*$', clean_text, re.IGNORECASE):
-        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
+        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else (convert_metric_to_imperial_advanced(clean_text) if direction == "ru_en" else clean_text)
 
     if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
-        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
+        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else (convert_metric_to_imperial_advanced(clean_text) if direction == "ru_en" else clean_text)
 
     lower_clean = clean_text.lower()
     normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
@@ -284,8 +318,10 @@ def process_text_smart(text, direction="en_ru"):
     def apply_units(val):
         if direction in ["en_ru", "en_zh_ru"]:
             return convert_imperial_to_metric_advanced(val)
-        else:
+        elif direction == "ru_en":
             return convert_metric_to_imperial_advanced(val)
+        else:
+            return val
 
     for k in [normalized_key, lower_clean]:
         if k in CUSTOM_DICTIONARY:
@@ -312,8 +348,7 @@ def process_text_smart(text, direction="en_ru"):
     # Одиночный перевод через gtx API
     result = None
     try:
-        src_lang = 'auto' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
-        tgt_lang = 'ru' if direction in ['en_ru', 'en_zh_ru'] else 'en'
+        src_lang, tgt_lang = get_lang_codes(direction)
         encoded_text = urllib.parse.quote(clean_text)
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -380,8 +415,7 @@ def batch_translate_texts(texts_list, direction="en_ru"):
     if not uncached_texts:
         return results
 
-    src_lang = 'auto' if direction == 'en_zh_ru' else ('en' if direction == 'en_ru' else 'ru')
-    tgt_lang = 'ru' if direction in ['en_ru', 'en_zh_ru'] else 'en'
+    src_lang, tgt_lang = get_lang_codes(direction)
     
     batch_size = 10
     for start_idx in range(0, len(uncached_texts), batch_size):
@@ -415,8 +449,10 @@ def batch_translate_texts(texts_list, direction="en_ru"):
         if res is not None:
             if direction in ["en_ru", "en_zh_ru"]:
                 final_results.append(convert_imperial_to_metric_advanced(res))
-            else:
+            elif direction == "ru_en":
                 final_results.append(convert_metric_to_imperial_advanced(res))
+            else:
+                final_results.append(res)
         else:
             final_results.append(texts_list[i])
             
@@ -484,7 +520,7 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
+    suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     wb.save(output_path)
     return output_path
@@ -518,7 +554,7 @@ def process_word_file(input_file, direction):
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
+    suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     doc.save(output_path)
     return output_path
@@ -570,7 +606,7 @@ def process_pptx_file(input_file, direction):
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
+    suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     prs.save(output_path)
     return output_path
@@ -595,7 +631,7 @@ def process_text_document_file(input_file, direction):
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
+    suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
 
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -607,7 +643,7 @@ def process_text_document_file(input_file, direction):
 def process_pdf_file(input_file, direction):
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    suffix = "_EN_ZH_RU" if direction == "en_zh_ru" else ("_RU" if direction == "en_ru" else "_EN")
+    suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
 
     if Converter is not None:
@@ -683,8 +719,10 @@ async def cmd_start(message: Message, state: FSMContext):
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇬🇧 EN → RU 🇷🇺", callback_data="dir_en_ru")],
-        [InlineKeyboardButton(text="🌐 EN/ZH (Англ+Кит) → RU  🇷🇺", callback_data="dir_en_zh_ru")],
-        [InlineKeyboardButton(text="🇷🇺 RU → EN 🇬🇧", callback_data="dir_ru_en")]
+        [InlineKeyboardButton(text="🌐 EN/ZH (Англ+Кит) → RU 🇷🇺", callback_data="dir_en_zh_ru")],
+        [InlineKeyboardButton(text="🇷🇺 RU → EN 🇬🇧", callback_data="dir_ru_en")],
+        [InlineKeyboardButton(text="🇷🇺 RU → AZ 🇦🇿", callback_data="dir_ru_az")],
+        [InlineKeyboardButton(text="🇦🇿 AZ → RU 🇷🇺", callback_data="dir_az_ru")]
     ])
     
     if user_id in DEVELOPER_IDS:
@@ -698,22 +736,27 @@ async def cmd_start(message: Message, state: FSMContext):
 async def process_direction_callback(callback: CallbackQuery, state: FSMContext):
     if callback.data == "dir_en_zh_ru":
         direction = "en_zh_ru"
+        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
     elif callback.data == "dir_en_ru":
         direction = "en_ru"
-    else:
+        dir_name = "EN → RU"
+    elif callback.data == "dir_ru_en":
         direction = "ru_en"
+        dir_name = "RU → EN"
+    elif callback.data == "dir_ru_az":
+        direction = "ru_az"
+        dir_name = "RU → AZ (Русский → Азербайджанский)"
+    elif callback.data == "dir_az_ru":
+        direction = "az_ru"
+        dir_name = "AZ → RU (Азербайджанский → Русский)"
+    else:
+        direction = "en_ru"
+        dir_name = "EN → RU"
         
     await state.update_data(direction=direction)
     
     global CUSTOM_DICTIONARY
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
-    
-    if direction == "en_zh_ru":
-        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
-    elif direction == "en_ru":
-        dir_name = "EN → RU"
-    else:
-        dir_name = "RU → EN"
         
     await callback.message.edit_text(
         f"✅ Направление выбрано: {dir_name}.\n\n"
@@ -777,112 +820,67 @@ async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery, bot: 
 async def successful_payment_handler(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     file_path = data.get("file_path")
-    file_name = data.get("file_name")
     direction = data.get("direction", "en_ru")
-
+    
     if not file_path or not os.path.exists(file_path):
-        await message.answer("✅ Оплата прошла успешно, но файл не найден в сессии. Пожалуйста, отправьте файл повторно.")
+        await message.answer("❌ Файл не найден для обработки. Пожалуйста, отправьте документ заново.")
         return
 
-    status_msg = await message.answer("⏳ Оплата получена! Анализирую структуру файла...")
+    status_msg = await message.answer("🔄 Оплата принята! Начинаю перевод документа...")
     
+    loop = asyncio.get_running_loop()
     try:
         ext = os.path.splitext(file_path)[1].lower()
         if ext in ['.xlsx', '.xls']:
-            main_loop = asyncio.get_running_loop()
-            output_path = await asyncio.to_thread(
-                process_excel_file_sync_with_progress, 
-                file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
+            output_file = await loop.run_in_executor(
+                None, process_excel_file_sync_with_progress,
+                file_path, direction, bot, message.chat.id, status_msg.message_id, loop
             )
         else:
-            output_path = await asyncio.to_thread(process_single_file, file_path, direction)
+            output_file = await loop.run_in_executor(None, process_single_file, file_path, direction)
 
-        document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="✅ Готово! Файл успешно переведен. Если снова понадобится помощь — обращайтесь! 😎")
-        
-        try:
-            os.remove(file_path)
-            os.remove(output_path)
-            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
-        except:
-            pass
+        await bot.send_document(
+            chat_id=message.chat.id,
+            document=FSInputFile(output_file),
+            caption="✅ Перевод успешно завершен!"
+        )
     except Exception as e:
-        await message.answer(f"❌ Ошибка при обработке файла: {e}")
-    
-    await state.clear()
+        await message.answer(f"❌ Произошла ошибка при обработке файла: {e}")
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 
-async def execute_translation(message: Message, bot: Bot, document, direction, state: FSMContext):
-    status_msg = await message.answer("⏳ Скачиваю и анализирую файл...")
+async def execute_translation(message: Message, bot: Bot, document, direction: str, state: FSMContext):
+    status_msg = await message.answer("🔄 Загрузка файла и подготовка к переводу...")
     
-    local_path = None
-    output_path = None
+    file_info = await bot.get_file(document.file_id)
+    downloaded_file = await bot.download_file(file_info.file_path)
+    
+    temp_dir = Path("temp_downloads")
+    temp_dir.mkdir(exist_ok=True)
+    local_path = temp_dir / f"{uuid.uuid4()}_{document.file_name}"
+    with open(local_path, "wb") as f:
+        f.write(downloaded_file.read())
+
+    loop = asyncio.get_running_loop()
     try:
-        file_info = await bot.get_file(document.file_id)
-        downloaded_file = await bot.download_file(file_info.file_path)
-        
-        temp_dir = Path("temp_downloads")
-        temp_dir.mkdir(exist_ok=True)
-        local_path = temp_dir / f"{uuid.uuid4()}_{document.file_name}"
-        with open(local_path, "wb") as f:
-            f.write(downloaded_file.read())
-
         ext = os.path.splitext(document.file_name)[1].lower()
         if ext in ['.xlsx', '.xls']:
-            main_loop = asyncio.get_running_loop()
-            output_path = await asyncio.to_thread(
-                process_excel_file_sync_with_progress, 
-                str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
+            output_file = await loop.run_in_executor(
+                None, process_excel_file_sync_with_progress,
+                str(local_path), direction, bot, message.chat.id, status_msg.message_id, loop
             )
         else:
-            output_path = await asyncio.to_thread(process_single_file, str(local_path), direction)
-        
-        document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="👑 Файл успешно переведен! Спасибо за ожидание 🤝.")
-        
-        try:
-            if local_path and os.path.exists(local_path):
-                os.remove(local_path)
-            if output_path and os.path.exists(output_path):
-                os.remove(output_path)
-            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
-        except:
-            pass
-            
+            output_file = await loop.run_in_executor(None, process_single_file, str(local_path), direction)
+
+        await bot.send_document(
+            chat_id=message.chat.id,
+            document=FSInputFile(output_file),
+            caption="✅ Перевод успешно завершен!"
+        )
     except Exception as e:
-        import traceback
-        print("❌ ОШИБКА ПЕРЕВОДА:\n", traceback.format_exc())
-        await message.answer(f"❌ Ошибка при переводе: {e}")
-    
-    await state.clear()
-
-
-# ==================== FLASK ДЛЯ WEB SERVICE НА RENDER ====================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-
-def run_bot_polling():
-    if BOT_TOKEN == "77":
-        print("⚠️ ВНИМАНИЕ: Укажите актуальный токен бота в переменной BOT_TOKEN!")
-        return
-
-    async def _start():
-        bot = Bot(token=BOT_TOKEN)
-        dp = Dispatcher(storage=MemoryStorage())
-        dp.include_router(router)
-        print("🤖 Бот isa_drilling_translator_bot запущен и готов к работе...")
-        await dp.start_polling(bot, handle_signals=False)
-
-    asyncio.run(_start())
-
-
-if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
-    bot_thread.start()
-
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+        await message.answer(f"❌ Произошла ошибка при обработке файла: {e}")
+    finally:
+        if local_path.exists():
+            os.remove(local_path)
