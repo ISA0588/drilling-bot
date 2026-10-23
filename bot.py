@@ -390,4 +390,681 @@ def batch_translate_texts(texts_list, direction="en_ru"):
 
         # Проверка кэша
         cache_key = f"{direction}_{normalized_key}"
-        if cache_key in TRANSLATION
+        if cache_key in TRANSLATION_CACHE:
+            results[i] = TRANSLATION_CACHE[cache_key]
+            continue
+
+        uncached_indices.append(i)
+        uncached_texts.append(clean_text)
+
+    if not uncached_texts:
+        return results
+
+    if direction == 'en_zh_ru':
+        src_lang, tgt_lang = 'auto', 'ru'
+    elif direction == 'en_ru':
+        src_lang, tgt_lang = 'en', 'ru'
+    elif direction == 'ru_en':
+        src_lang, tgt_lang = 'ru', 'en'
+    elif direction == 'ru_az':
+        src_lang, tgt_lang = 'ru', 'az'
+    elif direction == 'az_ru':
+        src_lang, tgt_lang = 'az', 'ru'
+    else:
+        src_lang, tgt_lang = 'auto', 'ru'
+    
+    # Безопасный размер пачки и задержка во избежание блокировок API
+    batch_size = 5
+    for start_idx in range(0, len(uncached_texts), batch_size):
+        chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
+        chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
+        
+        for idx_in_chunk, single_text in enumerate(chunk_texts):
+            orig_idx = chunk_indices[idx_in_chunk]
+            try:
+                encoded_text = urllib.parse.quote(single_text)
+                url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    res_data = json.loads(response.read().decode('utf-8'))
+                    translated_sentence = "".join([item[0] for item in res_data[0] if item[0]])
+                    
+                    if translated_sentence.strip():
+                        clean_res = translated_sentence.strip()
+                        results[orig_idx] = clean_res
+                        norm_k = re.sub(r'[^\w\s]', '', single_text.lower()).strip()
+                        TRANSLATION_CACHE[f"{direction}_{norm_k}"] = clean_res
+                    else:
+                        results[orig_idx] = single_text
+            except Exception:
+                results[orig_idx] = single_text
+                
+        time.sleep(0.5)
+
+    final_results = []
+    for i, res in enumerate(results):
+        if res is not None:
+            if direction in ["en_ru", "en_zh_ru"]:
+                final_results.append(convert_imperial_to_metric_advanced(res))
+            elif direction in ["ru_en", "ru_az", "az_ru"]:
+                final_results.append(convert_metric_to_imperial_advanced(res))
+            else:
+                final_results.append(res)
+        else:
+            final_results.append(texts_list[i])
+            
+    return final_results
+
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ СУФФИКСЫ ФАЙЛОВ ====================
+def get_file_suffix(direction):
+    if direction == "en_zh_ru":
+        return "_EN_ZH_RU"
+    elif direction == "en_ru":
+        return "_RU"
+    elif direction == "ru_en":
+        return "_EN"
+    elif direction == "ru_az":
+        return "_AZ"
+    elif direction == "az_ru":
+        return "_RU"
+    return "_TR"
+
+
+# ==================== ОБРАБОТКА EXCEL С ПРОГРЕССОМ ====================
+def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    wb = openpyxl.load_workbook(input_file)
+    
+    cells_to_process = []
+    for sheet_name in wb.sheetnames:
+        sheet = wb[sheet_name]
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.value is not None and len(str(cell.value).strip()) > 0:
+                    cells_to_process.append((cell, str(cell.value)))
+
+    total_cells = len(cells_to_process)
+    batch_size = 40
+    processed_count = 0
+    last_update_time = 0
+
+    for sheet_name in wb.sheetnames:
+        sheet = wb[sheet_name]
+        translated_name = process_text_smart(sheet_name, direction)
+        if translated_name and translated_name != sheet_name:
+            clean = ''.join([c for c in translated_name if c not in r'\/?*:[ ]'])[:31].strip()
+            if clean:
+                final_name = clean
+                counter = 1
+                while final_name in wb.sheetnames and final_name != sheet.title:
+                    final_name = f"{clean[:27]} ({counter})"
+                    counter += 1
+                sheet.title = final_name
+
+    for i in range(0, total_cells, batch_size):
+        batch = cells_to_process[i:i + batch_size]
+        texts = [item[1] for item in batch]
+        translated_texts = batch_translate_texts(texts, direction)
+        
+        for (cell, _), trans in zip(batch, translated_texts):
+            cell.alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
+            if trans and trans != cell.value:
+                cell.value = trans
+            processed_count += 1
+
+        if total_cells > 0 and (time.time() - last_update_time > 2.0 or processed_count == total_cells):
+            percent = int((processed_count / total_cells) * 100)
+            bar_filled = "█" * (percent // 10)
+            bar_empty = "░" * (10 - (percent // 10))
+            progress_text = (
+                f"⏳ Идет пакетный перевод Excel...\n"
+                f"[{bar_filled}{bar_empty}] {percent}%\n"
+                f"Обработано ячеек: {processed_count} из {total_cells}"
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+                    main_loop
+                )
+            except Exception:
+                pass
+            last_update_time = time.time()
+
+    dir_path, full_name = os.path.split(input_file)
+    name, ext = os.path.splitext(full_name)
+    suffix = get_file_suffix(direction)
+    output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
+    wb.save(output_path)
+    return output_path
+
+
+# ==================== УНИВЕРСАЛЬНЫЙ ПАКЕТНЫЙ ПЕРЕВОД С ПРОГРЕССОМ ДЛЯ ОСТАЛЬНЫХ ФАЙЛОВ ====================
+def batch_translate_with_progress(items_list, direction, bot: Bot, chat_id: int, message_id: int, main_loop, file_type_name="документа"):
+    """Пакетный перевод произвольных списков элементов с обновлением статус-сообщения в Telegram"""
+    total = len(items_list)
+    if total == 0:
+        return []
+
+    results = [None] * total
+    batch_size = 15
+    processed_count = 0
+    last_update_time = 0
+
+    for i in range(0, total, batch_size):
+        chunk_items = items_list[i:i + batch_size]
+        texts = [item['text'] for item in chunk_items]
+        translated_texts = batch_translate_texts(texts, direction)
+
+        for item, trans in zip(chunk_items, translated_texts):
+            results[item['index']] = trans
+            processed_count += 1
+
+        if total > 0 and (time.time() - last_update_time > 2.0 or processed_count == total):
+            percent = int((processed_count / total) * 100)
+            bar_filled = "█" * (percent // 10)
+            bar_empty = "░" * (10 - (percent // 10))
+            progress_text = (
+                f"⏳ Идет пакетный перевод {file_type_name}...\n"
+                f"[{bar_filled}{bar_empty}] {percent}%\n"
+                f"Обработано элементов: {processed_count} из {total}"
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+                    main_loop
+                )
+            except Exception:
+                pass
+            last_update_time = time.time()
+
+    return results
+
+
+# ==================== ОБРАБОТКА WORD С ПРОГРЕССОМ ====================
+def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    doc = Document(input_file)
+    
+    items_to_translate = []
+    
+    # Абзацы
+    paragraphs_map = []
+    for p in doc.paragraphs:
+        if p.text.strip():
+            paragraphs_map.append(p)
+            items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+
+    # Таблицы
+    cells_map = []
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    cells_map.append(cell)
+                    items_to_translate.append({'text': cell.text, 'index': len(items_to_translate)})
+
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
+    )
+
+    # Применяем переводы к абзацам
+    para_count = len(paragraphs_map)
+    for idx, p in enumerate(paragraphs_map):
+        trans = translated_results[idx]
+        if trans and trans != p.text:
+            p.text = trans
+
+    # Применяем переводы к ячейкам
+    for idx, cell in enumerate(cells_map):
+        res_idx = para_count + idx
+        trans = translated_results[res_idx]
+        if trans and trans != cell.text:
+            cell.text = trans
+
+    dir_path, full_name = os.path.split(input_file)
+    name, ext = os.path.splitext(full_name)
+    suffix = get_file_suffix(direction)
+    output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
+    doc.save(output_path)
+    return output_path
+
+
+def translate_word_document_in_place(doc, direction):
+    paragraphs_to_translate = [p for p in doc.paragraphs if p.text.strip()]
+    p_texts = [p.text for p in paragraphs_to_translate]
+    if p_texts:
+        translated_p_texts = batch_translate_texts(p_texts, direction)
+        for p, trans in zip(paragraphs_to_translate, translated_p_texts):
+            if trans and trans != p.text:
+                p.text = trans
+
+    for table in doc.tables:
+        cells_list = []
+        c_texts = []
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    cells_list.append(cell)
+                    c_texts.append(cell.text)
+        if c_texts:
+            translated_c_texts = batch_translate_texts(c_texts, direction)
+            for cell, trans in zip(cells_list, translated_c_texts):
+                if trans and trans != cell.text:
+                    cell.text = trans
+
+
+# ==================== ОБРАБОТКА POWERPOINT С ПРОГРЕССОМ ====================
+def process_pptx_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    prs = Presentation(input_file)
+    items_to_translate = []
+    shapes_refs = []
+
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    for r in paragraph.runs:
+                        if r.text.strip():
+                            shapes_refs.append(('run', r))
+                            items_to_translate.append({'text': r.text, 'index': len(items_to_translate)})
+            elif shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            shapes_refs.append(('cell', cell))
+                            items_to_translate.append({'text': cell.text, 'index': len(items_to_translate)})
+
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PowerPoint"
+    )
+
+    for idx, (ref_type, ref_obj) in enumerate(shapes_refs):
+        trans = translated_results[idx]
+        if trans and trans != ref_obj.text:
+            ref_obj.text = trans
+
+    dir_path, full_name = os.path.split(input_file)
+    name, ext = os.path.splitext(full_name)
+    suffix = get_file_suffix(direction)
+    output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
+    prs.save(output_path)
+    return output_path
+
+
+# ==================== ОБРАБОТКА ТЕКСТОВЫХ ФАЙЛОВ С ПРОГРЕССОМ ====================
+def process_text_document_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    
+    items_to_translate = []
+    for idx, line in enumerate(lines):
+        if line.strip():
+            items_to_translate.append({'text': line.strip(), 'index': idx})
+
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="текста"
+    )
+
+    translated_lines = []
+    for idx, line in enumerate(lines):
+        trans = translated_results[idx]
+        if trans and trans.strip():
+            prefix = line[:len(line) - len(line.lstrip())]
+            suffix = line[len(line.rstrip()):]
+            translated_lines.append(prefix + trans + suffix)
+        else:
+            translated_lines.append(line)
+
+    dir_path, full_name = os.path.split(input_file)
+    name, ext = os.path.splitext(full_name)
+    suffix = get_file_suffix(direction)
+    output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.writelines(translated_lines)
+    return output_path
+
+
+# ==================== ОБРАБОТКА PDF С ПРОГРЕССОМ ====================
+def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    dir_path, full_name = os.path.split(input_file)
+    name, ext = os.path.splitext(full_name)
+    suffix = get_file_suffix(direction)
+    output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
+
+    if Converter is not None:
+        try:
+            cv = Converter(input_file)
+            cv.convert(output_path, start=0, end=None)
+            cv.close()
+            doc = Document(output_path)
+            
+            # Собираем все абзацы и ячейки для перевода с прогрессом
+            items_to_translate = []
+            paragraphs_map = []
+            for p in doc.paragraphs:
+                if p.text.strip():
+                    paragraphs_map.append(p)
+                    items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+
+            cells_map = []
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            cells_map.append(cell)
+                            items_to_translate.append({'text': cell.text, 'index': len(items_to_translate)})
+
+            translated_results = batch_translate_with_progress(
+                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (Word)"
+            )
+
+            para_count = len(paragraphs_map)
+            for idx, p in enumerate(paragraphs_map):
+                trans = translated_results[idx]
+                if trans and trans != p.text:
+                    p.text = trans
+
+            for idx, cell in enumerate(cells_map):
+                res_idx = para_count + idx
+                trans = translated_results[res_idx]
+                if trans and trans != cell.text:
+                    cell.text = trans
+
+            doc.save(output_path)
+            return output_path
+        except Exception:
+            pass
+
+    out_doc = Document()
+    raw_texts = []
+    if fitz is not None:
+        doc_pdf = fitz.open(input_file)
+        for idx, page in enumerate(doc_pdf, 1):
+            text = page.get_text("text")
+            raw_texts.append((idx, text))
+    else:
+        reader = PdfReader(input_file)
+        for idx, page in enumerate(reader.pages, 1):
+            text = page.extract_text()
+            raw_texts.append((idx, text))
+
+    items_to_translate = []
+    page_lines_map = []
+    for page_idx, text in raw_texts:
+        out_doc.add_heading(f"Страница {page_idx}", level=2)
+        if text:
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
+            for line in lines:
+                items_to_translate.append({'text': line, 'index': len(items_to_translate)})
+                page_lines_map.append((out_doc, line))
+
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
+    )
+
+    for idx, (doc_obj, orig_line) in enumerate(page_lines_map):
+        trans = translated_results[idx]
+        doc_obj.add_paragraph(trans if trans else orig_line)
+
+    out_doc.save(output_path)
+    return output_path
+
+
+def process_single_file_with_progress(file_path, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ['.docx']:
+        return process_word_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    elif ext == '.pptx':
+        return process_pptx_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    elif ext in ['.txt', '.md', '.csv']:
+        return process_text_document_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    elif ext == '.pdf':
+        return process_pdf_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    else:
+        raise ValueError(f"Неподдерживаемый формат файла: {ext}")
+
+
+# ==================== TELEGRAM BOT HANDLERS ====================
+
+router = Router()
+router.message.filter(F.from_user.is_bot == False)
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    welcome_text = (
+        "👋 Привет! Я ISA Drilling_translator_bot — универсальный переводчик документов "
+        "для нефтегазовой и инженерной сферы.\n\n"
+        "Поддерживаю форматы: Excel (.xlsx, .xls), Word (.docx), PowerPoint (.pptx), "
+        "Text/Markdown (.txt, .md, .csv), PDF (.pdf).\n\n"
+        "Выберите направление перевода:"
+    )
+    
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇬🇧 EN → RU 🇷🇺", callback_data="dir_en_ru")],
+        [InlineKeyboardButton(text="🌐 EN/ZH (Англ+Кит) → RU  🇷🇺", callback_data="dir_en_zh_ru")],
+        [InlineKeyboardButton(text="🇷🇺 RU → EN 🇬🇧", callback_data="dir_ru_en")],
+        [InlineKeyboardButton(text="🇷🇺 RU → AZ 🇦🇿", callback_data="dir_ru_az")],
+        [InlineKeyboardButton(text="🇦🇿 AZ → RU 🇷🇺", callback_data="dir_az_ru")]
+    ])
+    
+    if user_id in DEVELOPER_IDS:
+        welcome_text += "\n\n👑 Обнаружен ID спец-доступа (VIP): для вас все переводы бесплатны!"
+
+    await message.answer(welcome_text, reply_markup=kb)
+    await state.set_state(TranslateStates.waiting_for_direction)
+
+
+@router.callback_query(F.data.startswith("dir_"))
+async def process_direction_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "dir_en_zh_ru":
+        direction = "en_zh_ru"
+    elif callback.data == "dir_en_ru":
+        direction = "en_ru"
+    elif callback.data == "dir_ru_en":
+        direction = "ru_en"
+    elif callback.data == "dir_ru_az":
+        direction = "ru_az"
+    elif callback.data == "dir_az_ru":
+        direction = "az_ru"
+    else:
+        direction = "en_ru"
+        
+    await state.update_data(direction=direction)
+    
+    global CUSTOM_DICTIONARY
+    CUSTOM_DICTIONARY = load_custom_dictionary(direction)
+    
+    if direction == "en_zh_ru":
+        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
+    elif direction == "en_ru":
+        dir_name = "EN → RU"
+    elif direction == "ru_en":
+        dir_name = "RU → EN"
+    elif direction == "ru_az":
+        dir_name = "RU → AZ (Русский → Азербайджанский)"
+    elif direction == "az_ru":
+        dir_name = "AZ → RU (Азербайджанский → Русский)"
+    else:
+        dir_name = direction
+        
+    await callback.message.edit_text(
+        f"✅ Направление выбрано: {dir_name}.\n\n"
+        "Теперь отправьте мне пожалуйста файл для перевода. Я буду показывать прогресс выполнения!"
+    )
+    await state.set_state(TranslateStates.waiting_for_file)
+    await callback.answer()
+
+
+@router.message(TranslateStates.waiting_for_file, F.document)
+async def process_file_document(message: Message, state: FSMContext, bot: Bot):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    direction = data.get("direction", "en_ru")
+
+    document = message.document
+    file_name = document.file_name
+    ext = os.path.splitext(file_name)[1].lower()
+
+    supported_exts = ['.xlsx', '.xls', '.docx', '.pptx', '.txt', '.md', '.csv', '.pdf']
+    if ext not in supported_exts:
+        await message.answer(f"❌ Неподдерживаемый формат файла ({ext}). Поддерживаются: {', '.join(supported_exts)}")
+        return
+
+    if user_id not in DEVELOPER_IDS:
+        try:
+            prices = [LabeledPrice(label="Перевод документа (isa_drilling_translator)", amount=STARS_PRICE)]
+            await bot.send_invoice(
+                chat_id=message.chat.id,
+                title="Оплата перевода документа",
+                description=f"Перевод файла {file_name}",
+                payload=f"translate_{file_name}_{user_id}_{int(time.time())}",
+                currency="XTR",
+                prices=prices
+            )
+            file_info = await bot.get_file(document.file_id)
+            downloaded_file = await bot.download_file(file_info.file_path)
+            
+            temp_dir = Path("temp_downloads")
+            temp_dir.mkdir(exist_ok=True)
+            local_path = temp_dir / f"{uuid.uuid4()}_{file_name}"
+            with open(local_path, "wb") as f:
+                f.write(downloaded_file.read())
+
+            await state.update_data(file_path=str(local_path), file_name=file_name)
+            await message.answer(f"⭐️ Стоимость перевода этого файла: {STARS_PRICE} звезд.\nПожалуйста, подтвердите оплату выше.")
+            return
+        except Exception as e:
+            await message.answer(f"❌ Ошибка создания счета на оплату: {e}")
+            return
+
+    await execute_translation(message, bot, document, direction, state)
+
+
+@router.pre_checkout_query()
+async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery, bot: Bot):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    file_path = data.get("file_path")
+    file_name = data.get("file_name")
+    direction = data.get("direction", "en_ru")
+
+    if not file_path or not os.path.exists(file_path):
+        await message.answer("✅ Оплата прошла успешно, но файл не найден в сессии. Пожалуйста, отправьте файл повторно.")
+        return
+
+    status_msg = await message.answer("⏳ Оплата получена! Анализирую структуру файла...")
+    
+    try:
+        main_loop = asyncio.get_running_loop()
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ['.xlsx', '.xls']:
+            output_path = await asyncio.to_thread(
+                process_excel_file_sync_with_progress, 
+                file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+        else:
+            output_path = await asyncio.to_thread(
+                process_single_file_with_progress, 
+                file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+
+        document_to_send = FSInputFile(output_path)
+        await message.answer_document(document_to_send, caption="✅ Готово! Файл успешно переведен. Если снова понадобится помощь — обращайтесь! 😎")
+        
+        try:
+            os.remove(file_path)
+            os.remove(output_path)
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+        except:
+            pass
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при обработке файла: {e}")
+    
+    await state.clear()
+
+
+async def execute_translation(message: Message, bot: Bot, document, direction, state: FSMContext):
+    status_msg = await message.answer("⏳ Скачиваю и анализирую файл...")
+    
+    local_path = None
+    output_path = None
+    try:
+        file_info = await bot.get_file(document.file_id)
+        downloaded_file = await bot.download_file(file_info.file_path)
+        
+        temp_dir = Path("temp_downloads")
+        temp_dir.mkdir(exist_ok=True)
+        local_path = temp_dir / f"{uuid.uuid4()}_{document.file_name}"
+        with open(local_path, "wb") as f:
+            f.write(downloaded_file.read())
+
+        main_loop = asyncio.get_running_loop()
+        ext = os.path.splitext(document.file_name)[1].lower()
+        if ext in ['.xlsx', '.xls']:
+            output_path = await asyncio.to_thread(
+                process_excel_file_sync_with_progress, 
+                str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+        else:
+            output_path = await asyncio.to_thread(
+                process_single_file_with_progress, 
+                str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+        
+        document_to_send = FSInputFile(output_path)
+        await message.answer_document(document_to_send, caption="👑 Файл успешно переведен! Спасибо за ожидание 🤝.")
+        
+        try:
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+        except:
+            pass
+            
+    except Exception as e:
+        import traceback
+        print("❌ ОШИБКА ПЕРЕВОДА:\n", traceback.format_exc())
+        await message.answer(f"❌ Ошибка при переводе: {e}")
+    
+    await state.clear()
+
+
+# ==================== FLASK ДЛЯ WEB SERVICE НА RENDER ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+
+def run_bot_polling():
+    if BOT_TOKEN == "77":
+        print("⚠️ ВНИМАНИЕ: Укажите актуальный токен бота в переменной BOT_TOKEN!")
+        return
+
+    async def _start():
+        bot = Bot(token=BOT_TOKEN)
+        dp = Dispatcher(storage=MemoryStorage())
+        dp.include_router(router)
+        print("🤖 Бот isa_drilling_translator_bot запущен и готов к работе...")
+        await dp.start_polling(bot, handle_signals=False)
+
+    asyncio.run(_start())
+
+
+if __name__ == "__main__":
+    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
+    bot_thread.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
