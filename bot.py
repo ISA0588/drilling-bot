@@ -1,7 +1,8 @@
 """
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
 (Excel, Word, PowerPoint, Text, Markdown, PDF) с надежным пакетным переводом через gtx API, 
-сохранением глоссария, конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
+сохранением глоссария, конвертации единиц, распознаванием и переводом текста на изображениях в PDF 
+и интеграцией оплаты через Telegram Stars (10 звезд).
 """
 
 import os
@@ -17,6 +18,7 @@ from flask import Flask
 import urllib.request
 import urllib.parse
 import json
+import io
 
 import openpyxl
 from docx import Document
@@ -39,9 +41,16 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery
 
 try:
-    import fitz  # PyMuPDF для продвинутой работы с разметкой
+    import fitz  # PyMuPDF для продвинутой работы с разметкой и извлечения картинок из PDF
 except ImportError:
     fitz = None
+
+try:
+    import pytesseract
+    from PIL import Image
+except ImportError:
+    pytesseract = None
+    Image = None
 
 try:
     from pdf2docx import Converter  # Для сохранения таблиц, картинок и верстки при конвертации PDF в Word
@@ -320,3 +329,6 @@ def convert_metric_to_imperial_advanced(text):
     
     def replace_metric_tons(m):
         full_match = m.group(0)
+        try:
+            val = float(m.group(2).replace(',', ''))
+            lbs_
