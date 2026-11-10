@@ -666,13 +666,18 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
             paragraphs_map.append(p)
             items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
-    cells_map = []
+    cells_runs_map = []
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                clean_t = cell.text.strip()
-                cells_map.append(cell)
-                items_to_translate.append({'text': clean_t if clean_t else "", 'index': len(items_to_translate)})
+                for p in cell.paragraphs:
+                    for run in p.runs:
+                        if run.text.strip():
+                            cells_runs_map.append(run)
+                            items_to_translate.append({'text': run.text, 'index': len(items_to_translate)})
+                    if not p.runs and p.text.strip():
+                        cells_runs_map.append(p)
+                        items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
@@ -684,11 +689,12 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         if trans:
             set_paragraph_text_safe(p, trans)
 
-    for idx, cell in enumerate(cells_map):
+    for idx, element in enumerate(cells_runs_map):
         res_idx = para_count + idx
         trans = translated_results[res_idx]
-        if trans is not None and trans.strip():
-            cell.text = trans
+        if trans:
+            if hasattr(element, 'text'):
+                element.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -770,8 +776,8 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     """
-    Конвертация PDF в Word через pdf2docx с гарантированным сохранением структуры, таблиц и штампов,
-    с точным доступом и переводом текста внутри ячеек таблиц.
+    Конвертация PDF в Word через pdf2docx с сохранением структуры, а затем 
+    глубокий покомпонентный перевод текста таблиц и абзацев.
     """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -803,49 +809,8 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             cv.convert(output_path, start=0, end=None)
             cv.close()
             
-            doc = Document(output_path)
-            items_to_translate = []
-            paragraphs_map = []
-            cells_mapping = []
-
-            # 1. Собираем обычные абзацы документа
-            for p in doc.paragraphs:
-                clean_t = p.text.strip()
-                if clean_t:
-                    paragraphs_map.append(p)
-                    items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
-
-            # 2. Собираем параграфы внутри КАЖДОЙ ячейки КАЖДОЙ таблицы с сохранением нативной сетки Word
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        for cp in cell.paragraphs:
-                            clean_cp = cp.text.strip()
-                            if clean_cp:
-                                cells_mapping.append((cell, cp))
-                                items_to_translate.append({'text': clean_cp, 'index': len(items_to_translate)})
-
-            # Выполняем пакетный перевод всех элементов с прогресс-баром
-            translated_results = batch_translate_with_progress(
-                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
-            )
-
-            # Записываем переводы в обычные абзацы
-            para_count = len(paragraphs_map)
-            for idx, p in enumerate(paragraphs_map):
-                trans = translated_results[idx]
-                if trans:
-                    set_paragraph_text_safe(p, trans)
-
-            # Записываем переводы строго в ячейки таблиц через их параграфы, сохраняя исходную структуру и верстку
-            for idx, (cell, cp) in enumerate(cells_mapping):
-                res_idx = para_count + idx
-                trans = translated_results[res_idx]
-                if trans:
-                    set_paragraph_text_safe(cp, trans)
-
-            doc.save(output_path)
-            return output_path
+            # Обрабатываем полученный документ через нашу глубокую функцию вордовских таблиц
+            return process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
 
