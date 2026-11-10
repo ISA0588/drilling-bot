@@ -53,6 +53,7 @@ except ImportError:
     Image = None
 
 try:
+    import pdf2docx
     from pdf2docx import Converter  # Для сохранения таблиц, картинок и верстки при конвертации PDF в Word
 except ImportError:
     Converter = None
@@ -315,4 +316,151 @@ def convert_imperial_to_metric_advanced(text):
         return m.group(0)
         
     res = re.sub(r'([+\-±]+)?\s*(\d+(?:[\s\-.]\d+\/\d+|[.,]\d+|\/\d+)?)\s*(?:in|inch|["″]|дюйм[а-я]*)', replace_inch, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:bbls|bbl|barrels|баррел[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.158987:.1f} м³
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:bbls|bbl|barrels|баррел[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.158987:.1f} м³)", res, flags=re.IGNORECASE)
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:kl|kL|kiloliters|килолитр[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',','')):.1f} м³)", res, flags=re.IGNORECASE)
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:gal|gallons)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*3.78541:.1f} л)", res, flags=re.IGNORECASE)
+    return res
+
+
+def convert_metric_to_imperial_advanced(text):
+    if not isinstance(text, str):
+        return text
+    res = text
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:Н[·\.]м|Nm|N\s*m)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.737562:.1f} ft-lb)", res, flags=re.IGNORECASE)
+    
+    def replace_metric_tons(m):
+        full_match = m.group(0)
+        try:
+            val = float(m.group(2).replace(',', ''))
+            lbs_val = val / 0.00045359237
+            klbs_val = val / 0.45359237
+            if klbs_val >= 1:
+                return f"{full_match} (~{klbs_val:.1f} Klbs / {lbs_val:,.0f} lbs)"
+            else:
+                return f"{full_match} (~{lbs_val:.0f} lbs)"
+        except:
+            return full_match
+
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:т|тонн[а-я]*)', replace_metric_tons, res, flags=re.IGNORECASE)
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:МПа|MPa)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/0.00689476:.0f} psi)", res, flags=re.IGNORECASE)
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:м\b|метров|metres|meters|meter)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/0.3048:.1f} ft)", res, flags=re.IGNORECASE)
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:мм\b|mm)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/25.4:.2f} in)", res, flags=re.IGNORECASE)
+    return res
+
+
+def process_text_smart(text, direction="en_ru"):
+    if not isinstance(text, str):
+        return text
+    
+    clean_text = text.strip()
+    if not clean_text:
+        return text
+
+    if re.match(r'^(API|ISO|ГОСТ|ТУ|ANSI|ASME|DIN|EN)\s*[\d\-]+[A-Za-zА-Яа-я]*$', clean_text, re.IGNORECASE):
+        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
+
+    if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
+        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
+
+    lower_clean = clean_text.lower()
+    normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
+
+    def apply_units(val):
+        if direction in ["en_ru", "en_zh_ru"]:
+            return convert_imperial_to_metric_advanced(val)
+        elif direction in ["ru_en", "ru_az", "az_ru"]:
+            return convert_metric_to_imperial_advanced(val)
+        return val
+
+    for k in [normalized_key, lower_clean]:
+        if k in CUSTOM_DICTIONARY:
+            translated = CUSTOM_DICTIONARY[k]
+            if clean_text.isupper() and len(clean_text) > 1:
+                translated = translated.upper()
+            return apply_units(translated)
+
+    if CUSTOM_DICTIONARY:
+        keys_list = list(CUSTOM_DICTIONARY.keys())
+        matches = difflib.get_close_matches(normalized_key, keys_list, n=1, cutoff=0.85)
+        if matches:
+            matched_key = matches[0]
+            translated = CUSTOM_DICTIONARY[matched_key]
+            if clean_text.isupper() and len(clean_text) > 1:
+                translated = translated.upper()
+            return apply_units(translated)
+
+    cache_key = f"{direction}_{normalized_key}"
+    if cache_key in TRANSLATION_CACHE:
+        translated = TRANSLATION_CACHE[cache_key]
+        return apply_units(translated)
+
+    # Выбор языковой пары для API
+    if direction == 'en_zh_ru':
+        src_lang, tgt_lang = 'auto', 'ru'
+    elif direction == 'en_ru':
+        src_lang, tgt_lang = 'en', 'ru'
+    elif direction == 'ru_en':
+        src_lang, tgt_lang = 'ru', 'en'
+    elif direction == 'ru_az':
+        src_lang, tgt_lang = 'ru', 'az'
+    elif direction == 'az_ru':
+        src_lang, tgt_lang = 'az', 'ru'
+    else:
+        src_lang, tgt_lang = 'auto', 'ru'
+
+    # Одиночный перевод через gtx API с переключением на резервные ключи при ошибке
+    result = None
+    try:
+        encoded_text = urllib.parse.quote(clean_text)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            result = "".join([item[0] for item in res_data[0] if item[0]])
+    except Exception:
+        result = translate_via_paid_api(clean_text, src_lang, tgt_lang)
+
+    if not result or not result.strip():
+        result = translate_via_ollama(clean_text, direction)
+
+    if result and result.strip():
+        clean_result = result.strip()
+        TRANSLATION_CACHE[cache_key] = clean_result
+        return apply_units(clean_result)
+    else:
+        log_untranslated_term(clean_text)
+
+    return apply_units(clean_result)
+
+
+# ==================== РАСПОЗНАВАНИЕ И ПЕРЕВОД ТЕКСТА С КАРТИНОК В PDF (OCR) ====================
+def extract_and_translate_image_text(pdf_path, direction="en_ru"):
+    """
+    Извлекает все изображения из PDF-документа, распознает на них текст с помощью Tesseract OCR 
+    и возвращает список переведенных блоков текста для добавления в общий документ.
+    """
+    translated_image_texts = []
+    if not fitz or not pytesseract or not Image:
+        return translated_image_texts
+    
+    try:
+        doc = fitz.open(pdf_path)
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            image_list = page.get_images(full=True)
+            for img_index, img in enumerate(image_list):
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                
+                try:
+                    image = Image.open(io.BytesIO(image_bytes))
+                    ocr_text = pytesseract.image_to_string(image, lang='eng+rus+aze')
+                    if ocr_text and ocr_text.strip():
+                        translated_ocr = process_text_smart(ocr_text.strip(), direction)
+                        if translated_ocr:
+                            translated_image_texts.append(
+                                f"\n--- [Распознано с изображения №{img_index + 1} на стр. {page_num + 1}] ---\n{translated_ocr}\n----------------------------------------------------\n"
+                            )
+                except Exception as img_err:
+                    print(f"Ошибка OCR изображения {img_index} на странице {page_num}: {img
