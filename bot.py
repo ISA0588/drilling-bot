@@ -816,7 +816,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
-    # РЕЖИМ 1: Конвертация через pdf2docx с поабзацным переводом и очисткой таблиц
+    # Стабильная конвертация через pdf2docx с сохранением структуры таблиц и сетки
     if Converter is not None:
         try:
             cv = Converter(input_file)
@@ -828,14 +828,14 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             paragraphs_map = []
             cells_map = []
             
-            # Собираем целые абзацы текста
+            # Собираем целые абзацы текста вне таблиц
             for p in doc.paragraphs:
                 clean_t = p.text.strip()
                 if clean_t:
                     paragraphs_map.append(p)
                     items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Собираем текст целиком из ячеек таблиц
+            # Собираем текст целиком из ячеек таблиц без разрушения разметки
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
@@ -856,7 +856,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                 if trans:
                     set_paragraph_text_safe(p, trans)
 
-            # Перезапись текста в ячейках таблиц с полной очисткой
+            # Перезапись текста в ячейках таблиц без удаления самих ячеек
             for idx, cell in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
@@ -868,7 +868,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме, переходим к запасному разбору: {e}")
 
-    # РЕЖИМ 2: Запасной алгоритм генерации документа
+    # Запасной алгоритм генерации документа через PyMuPDF (fitz)
     out_doc = Document()
     raw_texts = []
     if fitz is not None:
