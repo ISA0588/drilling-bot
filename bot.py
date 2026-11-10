@@ -138,8 +138,10 @@ def load_custom_dictionary(direction="en_ru"):
                             custom_dict[col1.lower()] = col2
                         elif direction == "az_ru":
                             custom_dict[col2.lower()] = col1
+                        elif direction == "ru_en":
+                            custom_dict[col1.lower()] = col2
                         else:
-                            custom_dict[col2.lower()] = col1
+                            custom_dict[col1.lower()] = col2
             print(f"Загружен словарь ({direction}): {len(custom_dict)} записей.")
         except Exception as e:
             print(f"Ошибка чтения dictionary.xlsx: {e}")
@@ -160,6 +162,22 @@ def log_untranslated_term(term):
                 f.write(term + "\n")
     except Exception:
         pass
+
+
+def get_lang_codes(direction):
+    """Возвращает корректные коды языков (src, tgt) для Google API в зависимости от направления"""
+    if direction == 'en_zh_ru':
+        return 'auto', 'ru'
+    elif direction == 'en_ru':
+        return 'en', 'ru'
+    elif direction == 'ru_en':
+        return 'ru', 'en'
+    elif direction == 'ru_az':
+        return 'ru', 'az'
+    elif direction == 'az_ru':
+        return 'az', 'ru'
+    else:
+        return 'auto', 'ru'
 
 
 def translate_via_ollama(text, direction="en_ru"):
@@ -428,19 +446,7 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    if direction == 'en_zh_ru':
-        src_lang, tgt_lang = 'auto', 'ru'
-    elif direction == 'en_ru':
-        src_lang, tgt_lang = 'en', 'ru'
-    elif direction == 'ru_en':
-        src_lang, tgt_lang = 'ru', 'en'
-    elif direction == 'ru_az':
-        src_lang, tgt_lang = 'ru', 'az'
-    elif direction == 'az_ru':
-        src_lang, tgt_lang = 'az', 'ru'
-    else:
-        src_lang, tgt_lang = 'auto', 'ru'
-
+    src_lang, tgt_lang = get_lang_codes(direction)
     result = safe_translate_request(clean_text, src_lang, tgt_lang)
 
     if not result or not result.strip():
@@ -497,18 +503,7 @@ def batch_translate_texts(texts_list, direction="en_ru"):
     if not uncached_texts:
         return results
 
-    if direction == 'en_zh_ru':
-        src_lang, tgt_lang = 'auto', 'ru'
-    elif direction == 'en_ru':
-        src_lang, tgt_lang = 'en', 'ru'
-    elif direction == 'ru_en':
-        src_lang, tgt_lang = 'ru', 'en'
-    elif direction == 'ru_az':
-        src_lang, tgt_lang = 'ru', 'az'
-    elif direction == 'az_ru':
-        src_lang, tgt_lang = 'az', 'ru'
-    else:
-        src_lang, tgt_lang = 'auto', 'ru'
+    src_lang, tgt_lang = get_lang_codes(direction)
     
     batch_size = 10
     for start_idx in range(0, len(uncached_texts), batch_size):
@@ -878,7 +873,6 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
         doc_pdf = fitz.open(input_file)
         for idx, page in enumerate(doc_pdf, 1):
             text = page.get_text("text")
-            # Если страница представляет собой сплошную картинку (скан)
             if not text.strip() and pytesseract is not None:
                 pix = page.get_pixmap()
                 img_bytes = pix.tobytes("png")
