@@ -793,13 +793,13 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             doc_pdf_temp = fitz.open(input_file)
             total_pages = len(doc_pdf_temp)
             doc_pdf_temp.close()
-        except:
+        except Exception:
             pass
     if total_pages == 0:
         try:
             reader_temp = PdfReader(input_file)
             total_pages = len(reader_temp.pages)
-        except:
+        except Exception:
             total_pages = 1
 
     try:
@@ -815,7 +815,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
-    # РЕЖИМ 1: Конвертация через pdf2docx с заменой текста по run-элементам
+    # РЕЖИМ 1: Конвертация через pdf2docx с поабзацным переводом
     if Converter is not None:
         try:
             cv = Converter(input_file)
@@ -826,37 +826,41 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             items_to_translate = []
             paragraphs_map = []
             
+            # Собираем целые абзацы текста
             for p in doc.paragraphs:
-                for run in p.runs:
-                    if run.text.strip():
-                        paragraphs_map.append(run)
-                        items_to_translate.append({'text': run.text, 'index': len(items_to_translate)})
+                clean_t = p.text.strip()
+                if clean_t:
+                    paragraphs_map.append(p)
+                    items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
+            # Собираем текст из ячеек таблиц
             cells_map = []
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
-                        for p in cell.paragraphs:
-                            for run in p.runs:
-                                if run.text.strip():
-                                    cells_map.append(run)
-                                    items_to_translate.append({'text': run.text, 'index': len(items_to_translate)})
+                        clean_t = cell.text.strip()
+                        if clean_t:
+                            cells_map.append(cell)
+                            items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
+            # Пакетный перевод цельных предложений
             translated_results = batch_translate_with_progress(
                 items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
             )
 
+            # Перезапись текста в абзацах
             para_count = len(paragraphs_map)
-            for idx, run in enumerate(paragraphs_map):
+            for idx, p in enumerate(paragraphs_map):
                 trans = translated_results[idx]
                 if trans:
-                    run.text = trans
+                    p.text = trans
 
-            for idx, run in enumerate(cells_map):
+            # Перезапись текста в ячейках таблиц
+            for idx, cell in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
                 if trans:
-                    run.text = trans
+                    cell.text = trans
 
             doc.save(output_path)
             return output_path
