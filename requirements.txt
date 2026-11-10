@@ -9,3 +9,5 @@ requests
 pymupdf
 pdf2docx
 pandas
+pytesseract
+Pillow
