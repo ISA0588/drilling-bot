@@ -222,28 +222,27 @@ def translate_via_ollama(text, direction="en_ru"):
 
 
 def parse_inch_value(s):
-    s = s.strip()
+    """Распознает десятичные, дробные и слитные (171/2) значения дюймов"""
+    s = s.strip().replace(',', '.')
     try:
-        if '.' in s and '/' in s and '-' not in s and ' ' not in s:
-            parts = s.split('.')
-            if len(parts) == 2 and '/' in parts[1]:
-                sub_parts = parts[1].split('/')
-                return float(parts[0]) + float(sub_parts[0]) / float(sub_parts[1])
-        s_clean = s.replace(',', '.')
-        if '-' in s_clean and '/' in s_clean:
-            parts = s_clean.split('-')
-            sub_parts = parts[1].split('/')
-            return float(parts[0]) + float(sub_parts[0]) / float(sub_parts[1])
-        elif ' ' in s_clean and '/' in s_clean:
-            parts = s_clean.split()
-            sub_parts = parts[1].split('/')
-            return float(parts[0]) + float(sub_parts[0]) / float(sub_parts[1])
-        elif '/' in s_clean:
-            parts = s_clean.split('/')
-            return float(parts[0]) / float(parts[1])
+        if (' ' in s or '-' in s) and '/' in s:
+            parts = re.split(r'[\s\-]+', s)
+            whole = float(parts[0])
+            frac_parts = parts[1].split('/')
+            return whole + float(frac_parts[0]) / float(frac_parts[1])
+        elif '/' in s:
+            match = re.match(r'^(\d+)(\d)\/(\d)$', s)
+            if match:
+                whole = float(match.group(1))
+                num = float(match.group(2))
+                den = float(match.group(3))
+                return whole + num / den
+            else:
+                parts = s.split('/')
+                return float(parts[0]) / float(parts[1])
         else:
-            return float(s_clean)
-    except:
+            return float(s)
+    except Exception:
         return None
 
 
@@ -418,18 +417,18 @@ def process_text_smart(text, direction="en_ru"):
         return text
 
     if re.match(r'^(API|ISO|ГОСТ|ТУ|ANSI|ASME|DIN|EN)\s*[\d\-]+[A-Za-zА-Яа-я]*$', clean_text, re.IGNORECASE):
-        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
+        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru", "az_ru"] else convert_metric_to_imperial_advanced(clean_text)
 
     if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
-        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
+        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru", "az_ru"] else convert_metric_to_imperial_advanced(clean_text)
 
     lower_clean = clean_text.lower()
     normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
 
     def apply_units(val):
-        if direction in ["en_ru", "en_zh_ru"]:
+        if direction in ["en_ru", "en_zh_ru", "az_ru"]:
             return convert_imperial_to_metric_advanced(val)
-        elif direction in ["ru_en", "ru_az", "az_ru"]:
+        elif direction in ["ru_en", "ru_az"]:
             return convert_metric_to_imperial_advanced(val)
         return val
 
@@ -536,9 +535,10 @@ def batch_translate_texts(texts_list, direction="en_ru"):
     final_results = []
     for i, res in enumerate(results):
         if res is not None:
-            if direction in ["en_ru", "en_zh_ru"]:
+            # Конвертация единиц для направлений на русский язык
+            if direction in ["en_ru", "en_zh_ru", "az_ru"]:
                 final_results.append(convert_imperial_to_metric_advanced(res))
-            elif direction in ["ru_en", "ru_az", "az_ru"]:
+            elif direction in ["ru_en", "ru_az"]:
                 final_results.append(convert_metric_to_imperial_advanced(res))
             else:
                 final_results.append(res)
