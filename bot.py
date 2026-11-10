@@ -2,7 +2,8 @@
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
 (Excel, Word, PowerPoint, Text, Markdown, PDF) с надежным пакетным переводом через gtx API, 
 автоматической ротацией ключей (API_KEY1, API_KEY2...), сохранением глоссария, 
-конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
+конвертации единиц, полным OCR-распознаванием текстов на изображениях без их удаления 
+и интеграцией оплаты через Telegram Stars (10 звезд).
 """
 
 import os
@@ -18,6 +19,7 @@ from flask import Flask
 import urllib.request
 import urllib.parse
 import json
+import io
 
 import openpyxl
 from docx import Document
@@ -50,12 +52,18 @@ except ImportError:
     Converter = None
 
 try:
+    import pytesseract
+    from PIL import Image
+except ImportError:
+    pytesseract = None
+    Image = None
+
+try:
     import requests
 except ImportError:
     requests = None
 
 # ==================== КОНФИГУРАЦИЯ БОТА ====================
-# Токен бота считывается из переменных окружения (безопасный способ для Render / .env)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 DEVELOPER_IDS = {8186927099, 1153214776, 7785086792, 1359780349}  # ID с бесплатным доступом
 STARS_PRICE = 10                          # Стоимость перевода в Telegram Stars
@@ -71,7 +79,6 @@ class ApiKeyManager:
 
     def load_keys(self):
         self.keys = []
-        # Динамически ищем все переменные окружения вида API_KEY1, API_KEY2, ...
         i = 1
         while True:
             key_name = f"API_KEY{i}"
@@ -80,8 +87,6 @@ class ApiKeyManager:
                 self.keys.append(val.strip())
                 i += 1
             else:
-                # Проверяем небольшой запас на случай пропусков (например, пропущен API_KEY2, но есть API_KEY3)
-                # Если 3 раза подряд пусто — прекращаем поиск
                 found_any_ahead = False
                 for j in range(1, 4):
                     if os.environ.get(f"API_KEY{i + j}"):
@@ -105,15 +110,11 @@ class ApiKeyManager:
         print(f"⚠️ Ротация API-ключа: переключение с индекса {old_index + 1} на {self.current_index + 1}")
 
 
-# Инициализация глобального менеджера ключей
 api_manager = ApiKeyManager()
 
-
-# Глобальные переменные состояния
 CUSTOM_DICTIONARY = {}
 TRANSLATION_CACHE = {}
 
-# Состояния FSM для диалога с пользователем
 class TranslateStates(StatesGroup):
     waiting_for_direction = State()
     waiting_for_file = State()
@@ -144,7 +145,6 @@ def load_custom_dictionary(direction="en_ru"):
             print(f"Ошибка чтения dictionary.xlsx: {e}")
     return custom_dict
 
-# Первичная загрузка словаря по умолчанию
 CUSTOM_DICTIONARY = load_custom_dictionary("en_ru")
 
 
@@ -323,24 +323,35 @@ def convert_metric_to_imperial_advanced(text):
     return res
 
 
-# ==================== ОТКАЗОУСТОЙЧИВЫЙ СЕТЕВОЙ ПЕРЕВОДЧИК С РОТАЦИЕЙ КЛЮЧЕЙ ====================
+# ==================== OCR ВСПОМОГАТЕЛЬНЫЙ ФУНКЦИОНАЛ ====================
+def ocr_image_bytes(img_bytes, direction="en_ru"):
+    """Распознавание текста с графических элементов через Tesseract OCR"""
+    if pytesseract is None or Image is None:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        lang = "eng+rus"
+        if "az" in direction:
+            lang = "aze+rus+eng"
+        elif "zh" in direction:
+            lang = "chi_sim+eng+rus"
+            
+        text = pytesseract.image_to_string(img, lang=lang)
+        return text.strip()
+    except Exception as e:
+        print(f"⚠️ Ошибка OCR: {e}")
+        return ""
+
+
+# ==================== ОТКАЗОУСТОЙЧИВЫЙ СЕТЕВОЙ ПЕРЕВОДЧИК ====================
 def safe_translate_request(clean_text, src_lang, tgt_lang):
-    """
-    Выполняет запрос к gtx API с обработкой лимитов (429), сетевых ошибок и автоматической 
-    ротацией ключей. Если gtx недоступен/заблокирован, переключается на резервные ключи или Ollama.
-    """
     encoded_text = urllib.parse.quote(clean_text)
-    
-    # Попытка через стандартный беспрепятственный gtx (или с ротационным ключом, если требуется)
     attempts = max(1, len(api_manager.keys) + 1)
     
     for attempt in range(attempts):
         try:
             current_key = api_manager.get_current_key()
-            
-            # Если у нас есть ключи ротации, можем использовать кастомный эндпоинт или передавать ключ в заголовках/параметрах
             if current_key:
-                # Пример использования платного/резервного API ключа (например, Google Cloud Translate v2, если задан API_KEY)
                 url = f"https://translation.googleapis.com/language/translate/v2?key={current_key}&q={encoded_text}&source={src_lang}&target={tgt_lang}&format=text"
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=5) as response:
@@ -349,7 +360,6 @@ def safe_translate_request(clean_text, src_lang, tgt_lang):
                     if translated:
                         return translated
             else:
-                # Стандартный бесплатный gtx API
                 url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=5) as response:
@@ -358,7 +368,6 @@ def safe_translate_request(clean_text, src_lang, tgt_lang):
                     if result and result.strip():
                         return result
         except urllib.error.HTTPError as e:
-            # Ошибки лимитов (429 Too Many Requests) или блокировки
             if e.code in [429, 403, 503, 500]:
                 print(f"⚠️ Получена ошибка {e.code} от API. Выполняется ротация ключа...")
                 api_manager.rotate()
@@ -366,7 +375,6 @@ def safe_translate_request(clean_text, src_lang, tgt_lang):
             else:
                 break
         except Exception as e:
-            # Сетевые сбои / таймауты
             print(f"⚠️ Сетевая ошибка при запросе перевода: {e}. Ротация ключа...")
             api_manager.rotate()
             time.sleep(0.3)
@@ -420,7 +428,6 @@ def process_text_smart(text, direction="en_ru"):
         translated = TRANSLATION_CACHE[cache_key]
         return apply_units(translated)
 
-    # Определение языков
     if direction == 'en_zh_ru':
         src_lang, tgt_lang = 'auto', 'ru'
     elif direction == 'en_ru':
@@ -434,10 +441,8 @@ def process_text_smart(text, direction="en_ru"):
     else:
         src_lang, tgt_lang = 'auto', 'ru'
 
-    # Перевод с отказоустойчивостью и ротацией ключей
     result = safe_translate_request(clean_text, src_lang, tgt_lang)
 
-    # Если сетевой перевод недоступен — резервный локальный метод (Ollama)
     if not result or not result.strip():
         result = translate_via_ollama(clean_text, direction)
 
@@ -453,7 +458,6 @@ def process_text_smart(text, direction="en_ru"):
 
 # ==================== НАДЕЖНЫЙ ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ====================
 def batch_translate_texts(texts_list, direction="en_ru"):
-    """Пакетный перевод строк с поддержкой ротации ключей и отказоустойчивости"""
     if not texts_list:
         return []
     
@@ -540,7 +544,6 @@ def batch_translate_texts(texts_list, direction="en_ru"):
     return final_results
 
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ СУФФИКСЫ ФАЙЛОВ ====================
 def get_file_suffix(direction):
     if direction == "en_zh_ru":
         return "_EN_ZH_RU"
@@ -555,7 +558,7 @@ def get_file_suffix(direction):
     return "_TR"
 
 
-# ==================== ОБРАБОТКА EXCEL С ПРОГРЕССОМ ====================
+# ==================== ОБРАБОТКА ФАЙЛОВ ====================
 def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
     
@@ -780,7 +783,6 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
 
-    # Предварительный подсчет страниц для визуализации
     total_pages = 0
     if fitz is not None:
         try:
@@ -798,7 +800,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
 
     try:
         progress_text = (
-            f"📄 Анализ PDF документа...\n"
+            f"📄 Анализ PDF и сканирование изображений (OCR)...\n"
             f"[░░░░░░░░░░] 0%\n"
             f"Всего страниц обнаружено: {total_pages}"
         )
@@ -809,6 +811,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
+    # РЕЖИМ 1: Сохранение верстки, таблиц и исходных изображений через pdf2docx + OCR
     if Converter is not None:
         try:
             cv = Converter(input_file)
@@ -831,33 +834,55 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                             cells_map.append(cell)
                             items_to_translate.append({'text': cell.text, 'index': len(items_to_translate)})
 
+            # Извлечение и OCR всех вытащенных картинок из PDF без их удаления
+            if fitz is not None and pytesseract is not None:
+                doc_pdf = fitz.open(input_file)
+                for page in doc_pdf:
+                    for img in page.get_images():
+                        xref = img[0]
+                        base_image = doc_pdf.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        
+                        ocr_text = ocr_image_bytes(image_bytes, direction)
+                        if ocr_text:
+                            p_ocr = doc.add_paragraph()
+                            p_ocr.add_run(f"\n[Распознанный текст с изображения]: ").bold = True
+                            paragraphs_map.append(p_ocr)
+                            items_to_translate.append({'text': ocr_text, 'index': len(items_to_translate)})
+
             translated_results = batch_translate_with_progress(
-                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (Word)"
+                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (Word + OCR)"
             )
 
             para_count = len(paragraphs_map)
             for idx, p in enumerate(paragraphs_map):
                 trans = translated_results[idx]
-                if trans and trans != p.text:
+                if trans:
                     p.text = trans
 
             for idx, cell in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
-                if trans and trans != cell.text:
+                if trans:
                     cell.text = trans
 
             doc.save(output_path)
             return output_path
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Конвертация через pdf2docx вызвала исключение, переходим к запасному OCR-режиму: {e}")
 
+    # РЕЖИМ 2: Запасной алгоритм через PyMuPDF + Tesseract OCR (для сканов)
     out_doc = Document()
     raw_texts = []
     if fitz is not None:
         doc_pdf = fitz.open(input_file)
         for idx, page in enumerate(doc_pdf, 1):
             text = page.get_text("text")
+            # Если страница представляет собой сплошную картинку (скан)
+            if not text.strip() and pytesseract is not None:
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                text = ocr_image_bytes(img_bytes, direction)
             raw_texts.append((idx, text))
     else:
         reader = PdfReader(input_file)
@@ -875,42 +900,12 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                 items_to_translate.append({'text': line, 'index': len(items_to_translate)})
                 page_lines_map.append((out_doc, line))
 
-    # Пакетный перевод с живым обновлением прогресса страниц
-    total = len(items_to_translate)
-    results = [None] * total
-    batch_size = 15
-    processed_count = 0
-    last_update_time = 0
-
-    for i in range(0, total, batch_size):
-        chunk_items = items_to_translate[i:i + batch_size]
-        texts = [item['text'] for item in chunk_items]
-        translated_texts = batch_translate_texts(texts, direction)
-
-        for item, trans in zip(chunk_items, translated_texts):
-            results[item['index']] = trans
-            processed_count += 1
-
-        if total > 0 and (time.time() - last_update_time > 1.5 or processed_count == total):
-            percent = int((processed_count / total) * 100)
-            bar_filled = "█" * (percent // 10)
-            bar_empty = "░" * (10 - (percent // 10))
-            progress_text = (
-                f"⏳ Идет перевод PDF документа...\n"
-                f"[{bar_filled}{bar_empty}] {percent}%\n"
-                f"Обработано строк: {processed_count} из {total} (Всего страниц: {total_pages})"
-            )
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
-                    main_loop
-                )
-            except Exception:
-                pass
-            last_update_time = time.time()
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (OCR)"
+    )
 
     for idx, (doc_obj, orig_line) in enumerate(page_lines_map):
-        trans = results[idx]
+        trans = translated_results[idx]
         doc_obj.add_paragraph(trans if trans else orig_line)
 
     out_doc.save(output_path)
@@ -932,7 +927,6 @@ def process_single_file_with_progress(file_path, direction, bot: Bot, chat_id: i
 
 
 # ==================== TELEGRAM BOT HANDLERS ====================
-
 router = Router()
 router.message.filter(F.from_user.is_bot == False)
 
