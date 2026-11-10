@@ -781,4 +781,410 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
     return output_path
 
 
-def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id:
+def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    dir_path, full_name = os.path.split(input_file)
+    name, ext = os.path.splitext(full_name)
+    suffix = get_file_suffix(direction)
+    output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
+
+    total_pages = 0
+    if fitz is not None:
+        try:
+            doc_pdf_temp = fitz.open(input_file)
+            total_pages = len(doc_pdf_temp)
+            doc_pdf_temp.close()
+        except:
+            pass
+    if total_pages == 0:
+        try:
+            reader_temp = PdfReader(input_file)
+            total_pages = len(reader_temp.pages)
+        except:
+            total_pages = 1
+
+    try:
+        progress_text = (
+            f"📄 Анализ PDF и сканирование изображений (OCR)...\n"
+            f"[░░░░░░░░░░] 0%\n"
+            f"Всего страниц обнаружено: {total_pages}"
+        )
+        asyncio.run_coroutine_threadsafe(
+            bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+            main_loop
+        )
+    except Exception:
+        pass
+
+    # РЕЖИМ 1: Сохранение верстки, таблиц и исходных изображений через pdf2docx + OCR
+    if Converter is not None:
+        try:
+            cv = Converter(input_file)
+            cv.convert(output_path, start=0, end=None)
+            cv.close()
+            doc = Document(output_path)
+            
+            items_to_translate = []
+            paragraphs_map = []
+            for p in doc.paragraphs:
+                if p.text.strip():
+                    paragraphs_map.append(p)
+                    items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+
+            cells_map = []
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            cells_map.append(cell)
+                            items_to_translate.append({'text': cell.text, 'index': len(items_to_translate)})
+
+            # Извлечение и OCR всех вытащенных картинок из PDF без их удаления
+            if fitz is not None and pytesseract is not None:
+                doc_pdf = fitz.open(input_file)
+                for page in doc_pdf:
+                    for img in page.get_images():
+                        xref = img[0]
+                        base_image = doc_pdf.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        
+                        ocr_text = ocr_image_bytes(image_bytes, direction)
+                        if ocr_text:
+                            p_ocr = doc.add_paragraph()
+                            p_ocr.add_run(f"\n[Распознанный текст с изображения]: ").bold = True
+                            paragraphs_map.append(p_ocr)
+                            items_to_translate.append({'text': ocr_text, 'index': len(items_to_translate)})
+
+            translated_results = batch_translate_with_progress(
+                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (Word + OCR)"
+            )
+
+            para_count = len(paragraphs_map)
+            for idx, p in enumerate(paragraphs_map):
+                trans = translated_results[idx]
+                if trans:
+                    p.text = trans
+
+            for idx, cell in enumerate(cells_map):
+                res_idx = para_count + idx
+                trans = translated_results[res_idx]
+                if trans:
+                    cell.text = trans
+
+            doc.save(output_path)
+            return output_path
+        except Exception as e:
+            print(f"⚠️ Конвертация через pdf2docx вызвала исключение, переходим к запасному OCR-режиму: {e}")
+
+    # РЕЖИМ 2: Запасной алгоритм через PyMuPDF + Tesseract OCR (для сканов)
+    out_doc = Document()
+    raw_texts = []
+    if fitz is not None:
+        doc_pdf = fitz.open(input_file)
+        for idx, page in enumerate(doc_pdf, 1):
+            text = page.get_text("text")
+            if not text.strip() and pytesseract is not None:
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                text = ocr_image_bytes(img_bytes, direction)
+            raw_texts.append((idx, text))
+    else:
+        reader = PdfReader(input_file)
+        for idx, page in enumerate(reader.pages, 1):
+            text = page.extract_text()
+            raw_texts.append((idx, text))
+
+    items_to_translate = []
+    page_lines_map = []
+    for page_idx, text in raw_texts:
+        out_doc.add_heading(f"Страница {page_idx}", level=2)
+        if text:
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
+            for line in lines:
+                items_to_translate.append({'text': line, 'index': len(items_to_translate)})
+                page_lines_map.append((out_doc, line))
+
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (OCR)"
+    )
+
+    for idx, (doc_obj, orig_line) in enumerate(page_lines_map):
+        trans = translated_results[idx]
+        doc_obj.add_paragraph(trans if trans else orig_line)
+
+    out_doc.save(output_path)
+    return output_path
+
+
+def process_single_file_with_progress(file_path, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ['.docx']:
+        return process_word_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    elif ext == '.pptx':
+        return process_pptx_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    elif ext in ['.txt', '.md', '.csv']:
+        return process_text_document_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    elif ext == '.pdf':
+        return process_pdf_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    else:
+        raise ValueError(f"Неподдерживаемый формат файла: {ext}")
+
+
+# ==================== TELEGRAM BOT HANDLERS ====================
+router = Router()
+router.message.filter(F.from_user.is_bot == False)
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    welcome_text = (
+        "👋 Привет! Я ISA Drilling_translator_bot — универсальный переводчик документов "
+        "для нефтегазовой и инженерной сферы.\n\n"
+        "Поддерживаю форматы: Excel (.xlsx, .xls), Word (.docx), PowerPoint (.pptx), "
+        "Text/Markdown (.txt, .md, .csv), PDF (.pdf).\n\n"
+        "Выберите направление перевода:"
+    )
+    
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇬🇧 EN → RU 🇷🇺", callback_data="dir_en_ru")],
+        [InlineKeyboardButton(text="🌐 EN/ZH (Англ+Кит) → RU  🇷🇺", callback_data="dir_en_zh_ru")],
+        [InlineKeyboardButton(text="🇷🇺 RU → EN 🇬🇧", callback_data="dir_ru_en")],
+        [InlineKeyboardButton(text="🇷🇺 RU → AZ 🇦🇿", callback_data="dir_ru_az")],
+        [InlineKeyboardButton(text="🇦🇿 AZ → RU 🇷🇺", callback_data="dir_az_ru")]
+    ])
+    
+    if user_id in DEVELOPER_IDS:
+        welcome_text += "\n\n👑 Обнаружен ID спец-доступа (VIP): для вас все переводы бесплатны!"
+
+    await message.answer(welcome_text, reply_markup=kb)
+    await state.set_state(TranslateStates.waiting_for_direction)
+
+
+@router.callback_query(F.data.startswith("dir_"))
+async def process_direction_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "dir_en_zh_ru":
+        direction = "en_zh_ru"
+    elif callback.data == "dir_en_ru":
+        direction = "en_ru"
+    elif callback.data == "dir_ru_en":
+        direction = "ru_en"
+    elif callback.data == "dir_ru_az":
+        direction = "ru_az"
+    elif callback.data == "dir_az_ru":
+        direction = "az_ru"
+    else:
+        direction = "en_ru"
+        
+    await state.update_data(direction=direction)
+    
+    global CUSTOM_DICTIONARY
+    CUSTOM_DICTIONARY = load_custom_dictionary(direction)
+    
+    if direction == "en_zh_ru":
+        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
+    elif direction == "en_ru":
+        dir_name = "EN → RU"
+    elif direction == "ru_en":
+        dir_name = "RU → EN"
+    elif direction == "ru_az":
+        dir_name = "RU → AZ (Русский → Азербайджанский)"
+    elif direction == "az_ru":
+        dir_name = "AZ → RU (Азербайджанский → Русский)"
+    else:
+        dir_name = direction
+        
+    await callback.message.edit_text(
+        f"✅ Направление выбрано: {dir_name}.\n\n"
+        "Теперь отправьте мне пожалуйста файл для перевода. Я буду показывать прогресс выполнения!"
+    )
+    await state.set_state(TranslateStates.waiting_for_file)
+    await callback.answer()
+
+
+@router.message(TranslateStates.waiting_for_file, F.document)
+async def process_file_document(message: Message, state: FSMContext, bot: Bot):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    direction = data.get("direction", "en_ru")
+
+    document = message.document
+    file_name = document.file_name
+    ext = os.path.splitext(file_name)[1].lower()
+
+    supported_exts = ['.xlsx', '.xls', '.docx', '.pptx', '.txt', '.md', '.csv', '.pdf']
+    if ext not in supported_exts:
+        await message.answer(f"❌ Неподдерживаемый формат файла ({ext}). Поддерживаются: {', '.join(supported_exts)}")
+        return
+
+    if user_id not in DEVELOPER_IDS:
+        try:
+            prices = [LabeledPrice(label="Перевод документа (isa_drilling_translator)", amount=STARS_PRICE)]
+            await bot.send_invoice(
+                chat_id=message.chat.id,
+                title="Оплата перевода документа",
+                description=f"Перевод файла {file_name}",
+                payload=f"translate_{file_name}_{user_id}_{int(time.time())}",
+                currency="XTR",
+                prices=prices
+            )
+            file_info = await bot.get_file(document.file_id)
+            downloaded_file = await bot.download_file(file_info.file_path)
+            
+            temp_dir = Path("temp_downloads")
+            temp_dir.mkdir(exist_ok=True)
+            local_path = temp_dir / f"{uuid.uuid4()}_{file_name}"
+            with open(local_path, "wb") as f:
+                f.write(downloaded_file.read())
+
+            await state.update_data(file_path=str(local_path), file_name=file_name)
+            await message.answer(f"⭐️ Стоимость перевода этого файла: {STARS_PRICE} звезд.\nПожалуйста, подтвердите оплату выше.")
+            return
+        except Exception as e:
+            await message.answer(f"❌ Ошибка создания счета на оплату: {e}")
+            return
+
+    await execute_translation(message, bot, document, direction, state)
+
+
+@router.pre_checkout_query()
+async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery, bot: Bot):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    file_path = data.get("file_path")
+    file_name = data.get("file_name")
+    direction = data.get("direction", "en_ru")
+
+    if not file_path or not os.path.exists(file_path):
+        await message.answer("✅ Оплата прошла успешно, но файл не найден в сессии. Пожалуйста, отправьте файл повторно.")
+        return
+
+    status_msg = await message.answer("⏳ Оплата получена! Анализирую структуру файла...")
+    
+    try:
+        main_loop = asyncio.get_running_loop()
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ['.xlsx', '.xls']:
+            output_path = await asyncio.to_thread(
+                process_excel_file_sync_with_progress, 
+                file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+        else:
+            output_path = await asyncio.to_thread(
+                process_single_file_with_progress, 
+                file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+
+        document_to_send = FSInputFile(output_path)
+        await message.answer_document(document_to_send, caption="✅ Готово! Файл успешно переведен. Если снова понадобится помощь — обращайтесь! 😎")
+        
+        try:
+            os.remove(file_path)
+            os.remove(output_path)
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+        except:
+            pass
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при обработке файла: {e}")
+    
+    await state.clear()
+
+
+async def execute_translation(message: Message, bot: Bot, document, direction, state: FSMContext):
+    status_msg = await message.answer("⏳ Скачиваю и анализирую файл...")
+    
+    local_path = None
+    output_path = None
+    try:
+        file_info = await bot.get_file(document.file_id)
+        downloaded_file = await bot.download_file(file_info.file_path)
+        
+        temp_dir = Path("temp_downloads")
+        temp_dir.mkdir(exist_ok=True)
+        local_path = temp_dir / f"{uuid.uuid4()}_{document.file_name}"
+        with open(local_path, "wb") as f:
+            f.write(downloaded_file.read())
+
+        main_loop = asyncio.get_running_loop()
+        ext = os.path.splitext(document.file_name)[1].lower()
+        if ext in ['.xlsx', '.xls']:
+            output_path = await asyncio.to_thread(
+                process_excel_file_sync_with_progress, 
+                str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+        else:
+            output_path = await asyncio.to_thread(
+                process_single_file_with_progress, 
+                str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
+            )
+        
+        document_to_send = FSInputFile(output_path)
+        await message.answer_document(document_to_send, caption="👑 Файл успешно переведен! Спасибо за ожидание 🤝.")
+        
+        try:
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+        except:
+            pass
+            
+    except Exception as e:
+        import traceback
+        print("❌ ОШИБКА ПЕРЕВОДА:\n", traceback.format_exc())
+        await message.answer(f"❌ Ошибка при переводе: {e}")
+    
+    await state.clear()
+
+
+# ==================== WEBHOOK СЕРВЕР НА AIOHTTP ДЛЯ RENDER ====================
+async def on_startup(bot: Bot):
+    # При запуске сервера подставляем адрес вебхука в Telegram API
+    if WEBHOOK_HOST:
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        print(f"🔗 Вебхук успешно зарегистрирован в Telegram: {WEBHOOK_URL}")
+    else:
+        print("⚠️ Переменная RENDER_EXTERNAL_URL не найдена, убедитесь в настройках сервера!")
+
+
+def main():
+    if not BOT_TOKEN:
+        print("❌ ОШИБКА: Переменная окружения BOT_TOKEN не задана!")
+        return
+
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    # Регистрация хука на запуск
+    dp.startup.register(on_startup)
+
+    app = web.Application()
+
+    # Health-check маршрут для проверок Render
+    async def health_check(request):
+        return web.Response(text="Bot is running via Webhook!")
+
+    app.router.add_get("/", health_check)
+
+    # Обработчик запросов Webhook от Telegram
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    print(f"🤖 Запуск Webhook-сервера на порту {WEBAPP_PORT}...")
+    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+
+
+if __name__ == "__main__":
+    main()
