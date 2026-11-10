@@ -23,11 +23,6 @@ from docx import Document
 from pptx import Presentation
 from pypdf import PdfReader
 
-try:
-    import pdfplumber  # Для точного нативного извлечения таблиц и структуры из PDF
-except ImportError:
-    pdfplumber = None
-
 # Импорты для aiogram v3 и Webhook (aiohttp)
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
@@ -43,6 +38,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
+
+try:
+    from pdf2docx import Converter  # Для точного сохранения картинок и верстки PDF в Word
+except ImportError:
+    Converter = None
 
 try:
     import pytesseract
@@ -341,25 +341,49 @@ def convert_metric_to_imperial_advanced(text):
     return res
 
 
+# ==================== OCR ВСПОМОГАТЕЛЬНЫЙ ФУНКЦИОНАЛ ====================
+def ocr_image_bytes(img_bytes, direction="en_ru"):
+    """Распознавание текста с графических элементов через Tesseract OCR"""
+    if pytesseract is None or Image is None:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        lang = "eng+rus"
+        if "az" in direction:
+            lang = "aze+rus+eng"
+        elif "zh" in direction:
+            lang = "chi_sim+eng+rus"
+            
+        text = pytesseract.image_to_string(img, lang=lang)
+        return text.strip()
+    except Exception as e:
+        print(f"⚠️ Ошибка OCR: {e}")
+        return ""
+
+
 # ==================== ОТКАЗОУСТОЙЧИВЫЙ СЕТЕВОЙ ПЕРЕВОДЧИК ====================
 def safe_translate_request(clean_text, src_lang, tgt_lang):
+    """Надежный прямой запрос к переводчику Google с поддержкой всех языков"""
     if not clean_text or not clean_text.strip():
         return clean_text
 
     encoded_text = urllib.parse.quote(clean_text)
+    
+    # 1. Прямой стабильный запрос через Google Translate GTX
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         with urllib.request.urlopen(req, timeout=10) as response:
             res_data = json.loads(response.read().decode('utf-8'))
             result = "".join([item[0] for item in res_data[0] if item[0]])
             if result and result.strip():
                 return result.strip()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ Сетевая ошибка GTX перевода: {e}")
 
+    # 2. Резервный вызов API v2 с ротацией ключей
     attempts = max(1, len(api_manager.keys) + 1)
-    for _ in range(attempts):
+    for attempt in range(attempts):
         try:
             current_key = api_manager.get_current_key()
             if current_key:
@@ -386,6 +410,7 @@ def safe_translate_request(clean_text, src_lang, tgt_lang):
 def process_text_smart(text, direction="en_ru"):
     if not isinstance(text, str):
         return text
+    
     clean_text = text.strip()
     if not clean_text:
         return text
@@ -412,7 +437,8 @@ def process_text_smart(text, direction="en_ru"):
 
     cache_key = f"{direction}_{normalized_key}"
     if cache_key in TRANSLATION_CACHE:
-        return apply_units(TRANSLATION_CACHE[cache_key])
+        translated = TRANSLATION_CACHE[cache_key]
+        return apply_units(translated)
 
     src_lang, tgt_lang = get_lang_codes(direction)
     result = safe_translate_request(clean_text, src_lang, tgt_lang)
@@ -424,10 +450,13 @@ def process_text_smart(text, direction="en_ru"):
         clean_result = result.strip()
         TRANSLATION_CACHE[cache_key] = clean_result
         return apply_units(clean_result)
+    else:
+        log_untranslated_term(clean_text)
 
     return apply_units(clean_text)
 
 
+# ==================== НАДЕЖНЫЙ ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ====================
 def batch_translate_texts(texts_list, direction="en_ru"):
     if not texts_list:
         return []
@@ -513,9 +542,17 @@ def get_file_suffix(direction):
     return "_TR"
 
 
+def set_paragraph_text_safe(paragraph, new_text):
+    """Безопасно очищает содержимое параграфа и вставляет переведенный текст"""
+    p_elem = paragraph._element
+    p_elem.clear_content()
+    paragraph.add_run(new_text)
+
+
 # ==================== ОБРАБОТКА ФАЙЛОВ ====================
 def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
+    
     cells_to_process = []
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
@@ -528,6 +565,19 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
     batch_size = 40
     processed_count = 0
     last_update_time = 0
+
+    for sheet_name in wb.sheetnames:
+        sheet = wb[sheet_name]
+        translated_name = process_text_smart(sheet_name, direction)
+        if translated_name and translated_name != sheet_name:
+            clean = ''.join([c for c in translated_name if c not in r'\/?*:[ ]'])[:31].strip()
+            if clean:
+                final_name = clean
+                counter = 1
+                while final_name in wb.sheetnames and final_name != sheet.title:
+                    final_name = f"{clean[:27]} ({counter})"
+                    counter += 1
+                sheet.title = final_name
 
     for i in range(0, total_cells, batch_size):
         batch = cells_to_process[i:i + batch_size]
@@ -637,14 +687,14 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     for idx, p in enumerate(paragraphs_map):
         trans = translated_results[idx]
         if trans:
-            p._element.clear_content()
-            p.add_run(trans)
+            set_paragraph_text_safe(p, trans)
 
     for idx, element in enumerate(cells_runs_map):
         res_idx = para_count + idx
         trans = translated_results[res_idx]
-        if trans and hasattr(element, 'text'):
-            element.text = trans
+        if trans:
+            if hasattr(element, 'text'):
+                element.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -678,7 +728,7 @@ def process_pptx_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PowerPoint"
     )
 
-    for idx, (_, ref_obj) in enumerate(shapes_refs):
+    for idx, (ref_type, ref_obj) in enumerate(shapes_refs):
         trans = translated_results[idx]
         if trans and trans != ref_obj.text:
             ref_obj.text = trans
@@ -726,25 +776,23 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     """
-    Точный разбор PDF через pdfplumber с сохранением оригинальной многоколоночной сетки таблиц 
-    и полным пакетным переводом ячеек.
+    Конвертация PDF в Word через pdf2docx с сохранением структуры, а затем 
+    глубокий покомпонентный перевод текста таблиц и абзацев.
     """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
     suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
 
-    total_pages = 1
-    if pdfplumber is not None:
-        try:
-            with pdfplumber.open(input_file) as pdf:
-                total_pages = len(pdf.pages)
-        except Exception:
-            pass
+    try:
+        reader_temp = PdfReader(input_file)
+        total_pages = len(reader_temp.pages)
+    except Exception:
+        total_pages = 1
 
     try:
         progress_text = (
-            f"📄 Точный анализ структуры и таблиц PDF через pdfplumber...\n"
+            f"📄 Конвертация PDF с сохранением таблиц и структуры...\n"
             f"[░░░░░░░░░░] 0%\n"
             f"Всего страниц: {total_pages}"
         )
@@ -755,68 +803,16 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
-    if pdfplumber is not None:
+    if Converter is not None:
         try:
-            out_doc = Document()
-            items_to_translate = []
-            extraction_plan = []
-
-            with pdfplumber.open(input_file) as pdf:
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    text = page.extract_text()
-                    
-                    if tables:
-                        for table in tables:
-                            table_struct = []
-                            for row in table:
-                                row_cells = []
-                                for cell in row:
-                                    cell_text = (cell or "").strip().replace('\n', ' ')
-                                    row_cells.append(cell_text)
-                                    items_to_translate.append({'text': cell_text if cell_text else "", 'index': len(items_to_translate)})
-                                table_struct.append(row_cells)
-                                
-                            if table_struct:
-                                extraction_plan.append(('table', table_struct))
-                    
-                    if text:
-                        lines = [l.strip() for l in text.split('\n') if l.strip()]
-                        for line in lines:
-                            extraction_plan.append(('paragraph', line))
-                            items_to_translate.append({'text': line, 'index': len(items_to_translate)})
-
-            translated_results = batch_translate_with_progress(
-                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
-            )
-
-            global_idx = 0
-            for item_type, content in extraction_plan:
-                if item_type == 'paragraph':
-                    trans = translated_results[global_idx]
-                    global_idx += 1
-                    if trans:
-                        out_doc.add_paragraph(trans)
-                elif item_type == 'table':
-                    rows_count = len(content)
-                    cols_count = max(len(r) for r in content) if rows_count > 0 else 0
-                    
-                    if rows_count > 0 and cols_count > 0:
-                        table_elem = out_doc.add_table(rows=rows_count, cols=cols_count)
-                        table_elem.style = 'Table Grid'
-                        
-                        for r_idx, row in enumerate(content):
-                            for c_idx, orig_val in enumerate(row):
-                                trans_val = translated_results[global_idx]
-                                global_idx += 1
-                                
-                                cell = table_elem.cell(r_idx, c_idx)
-                                cell.text = trans_val if trans_val else orig_val
-
-            out_doc.save(output_path)
-            return output_path
+            cv = Converter(input_file)
+            cv.convert(output_path, start=0, end=None)
+            cv.close()
+            
+            # Обрабатываем полученный документ через нашу глубокую функцию вордовских таблиц
+            return process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
         except Exception as e:
-            print(f"⚠️ Ошибка pdfplumber парсинга: {e}")
+            print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
 
     # Запасной вариант через pypdf
     out_doc = Document()
