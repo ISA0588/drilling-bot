@@ -726,8 +726,8 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     """
-    Точный разбор PDF через pdfplumber с извлечением реальных таблиц, 
-    их переводом и построением идеальной сетки в Word.
+    Точный разбор PDF через pdfplumber с сохранением оригинальной многоколоночной сетки таблиц 
+    и полным пакетным переводом ячеек.
     """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -776,7 +776,9 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                                     row_cells.append(cell_text)
                                     items_to_translate.append({'text': cell_text if cell_text else "", 'index': len(items_to_translate)})
                                 table_struct.append(row_cells)
-                            extraction_plan.append(('table', table_struct))
+                                
+                            if table_struct:
+                                extraction_plan.append(('table', table_struct))
                     
                     if text:
                         lines = [l.strip() for l in text.split('\n') if l.strip()]
@@ -798,13 +800,16 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                 elif item_type == 'table':
                     rows_count = len(content)
                     cols_count = max(len(r) for r in content) if rows_count > 0 else 0
+                    
                     if rows_count > 0 and cols_count > 0:
                         table_elem = out_doc.add_table(rows=rows_count, cols=cols_count)
                         table_elem.style = 'Table Grid'
+                        
                         for r_idx, row in enumerate(content):
                             for c_idx, orig_val in enumerate(row):
                                 trans_val = translated_results[global_idx]
                                 global_idx += 1
+                                
                                 cell = table_elem.cell(r_idx, c_idx)
                                 cell.text = trans_val if trans_val else orig_val
 
