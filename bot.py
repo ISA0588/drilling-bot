@@ -804,7 +804,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
 
     try:
         progress_text = (
-            f"📄 Анализ PDF и сканирование изображений (OCR)...\n"
+            f"📄 Анализ PDF и подготовка к переводу...\n"
             f"[░░░░░░░░░░] 0%\n"
             f"Всего страниц обнаружено: {total_pages}"
         )
@@ -815,7 +815,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
-    # РЕЖИМ 1: Сохранение верстки, таблиц и исходных изображений через pdf2docx + OCR
+    # РЕЖИМ 1: Конвертация через pdf2docx с заменой текста по run-элементам
     if Converter is not None:
         try:
             cv = Converter(input_file)
@@ -825,67 +825,51 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             
             items_to_translate = []
             paragraphs_map = []
+            
             for p in doc.paragraphs:
-                if p.text.strip():
-                    paragraphs_map.append(p)
-                    items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+                for run in p.runs:
+                    if run.text.strip():
+                        paragraphs_map.append(run)
+                        items_to_translate.append({'text': run.text, 'index': len(items_to_translate)})
 
             cells_map = []
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
-                        if cell.text.strip():
-                            cells_map.append(cell)
-                            items_to_translate.append({'text': cell.text, 'index': len(items_to_translate)})
-
-            # Извлечение и OCR всех вытащенных картинок из PDF без их удаления
-            if fitz is not None and pytesseract is not None:
-                doc_pdf = fitz.open(input_file)
-                for page in doc_pdf:
-                    for img in page.get_images():
-                        xref = img[0]
-                        base_image = doc_pdf.extract_image(xref)
-                        image_bytes = base_image["image"]
-                        
-                        ocr_text = ocr_image_bytes(image_bytes, direction)
-                        if ocr_text:
-                            p_ocr = doc.add_paragraph()
-                            p_ocr.add_run(f"\n[Распознанный текст с изображения]: ").bold = True
-                            paragraphs_map.append(p_ocr)
-                            items_to_translate.append({'text': ocr_text, 'index': len(items_to_translate)})
+                        for p in cell.paragraphs:
+                            for run in p.runs:
+                                if run.text.strip():
+                                    cells_map.append(run)
+                                    items_to_translate.append({'text': run.text, 'index': len(items_to_translate)})
 
             translated_results = batch_translate_with_progress(
-                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (Word + OCR)"
+                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
             )
 
             para_count = len(paragraphs_map)
-            for idx, p in enumerate(paragraphs_map):
+            for idx, run in enumerate(paragraphs_map):
                 trans = translated_results[idx]
                 if trans:
-                    p.text = trans
+                    run.text = trans
 
-            for idx, cell in enumerate(cells_map):
+            for idx, run in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
                 if trans:
-                    cell.text = trans
+                    run.text = trans
 
             doc.save(output_path)
             return output_path
         except Exception as e:
-            print(f"⚠️ Конвертация через pdf2docx вызвала исключение, переходим к запасному OCR-режиму: {e}")
+            print(f"⚠️ Ошибка в pdf2docx режиме, переходим к текстовому разбору: {e}")
 
-    # РЕЖИМ 2: Запасной алгоритм через PyMuPDF + Tesseract OCR (для сканов)
+    # РЕЖИМ 2: Запасной алгоритм через PyMuPDF
     out_doc = Document()
     raw_texts = []
     if fitz is not None:
         doc_pdf = fitz.open(input_file)
         for idx, page in enumerate(doc_pdf, 1):
             text = page.get_text("text")
-            if not text.strip() and pytesseract is not None:
-                pix = page.get_pixmap()
-                img_bytes = pix.tobytes("png")
-                text = ocr_image_bytes(img_bytes, direction)
             raw_texts.append((idx, text))
     else:
         reader = PdfReader(input_file)
@@ -904,7 +888,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                 page_lines_map.append((out_doc, line))
 
     translated_results = batch_translate_with_progress(
-        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF (OCR)"
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
     )
 
     for idx, (doc_obj, orig_line) in enumerate(page_lines_map):
