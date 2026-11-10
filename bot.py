@@ -174,17 +174,17 @@ def log_untranslated_term(term):
 
 
 def get_lang_codes(direction):
-    """Возвращает корректные коды языков (src, tgt) для Google API в зависимости от направления"""
-    if direction == 'en_zh_ru':
-        return 'auto', 'ru'
+    """Возвращает корректные коды языков (src, tgt) для Google API"""
+    if direction == 'az_ru':
+        return 'az', 'ru'
     elif direction == 'en_ru':
         return 'en', 'ru'
     elif direction == 'ru_en':
         return 'ru', 'en'
     elif direction == 'ru_az':
         return 'ru', 'az'
-    elif direction == 'az_ru':
-        return 'az', 'ru'
+    elif direction == 'en_zh_ru':
+        return 'auto', 'ru'
     else:
         return 'auto', 'ru'
 
@@ -371,41 +371,48 @@ def ocr_image_bytes(img_bytes, direction="en_ru"):
 
 # ==================== ОТКАЗОУСТОЙЧИВЫЙ СЕТЕВОЙ ПЕРЕВОДЧИК ====================
 def safe_translate_request(clean_text, src_lang, tgt_lang):
+    """Надежный прямой запрос к переводчику Google с поддержкой всех языков"""
+    if not clean_text or not clean_text.strip():
+        return clean_text
+
     encoded_text = urllib.parse.quote(clean_text)
-    attempts = max(1, len(api_manager.keys) + 1)
     
+    # 1. Прямой стабильный запрос через Google Translate GTX
+    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            result = "".join([item[0] for item in res_data[0] if item[0]])
+            if result and result.strip():
+                return result.strip()
+    except Exception as e:
+        print(f"⚠️ Сетевая ошибка GTX перевода: {e}")
+
+    # 2. Резервный вызов API v2 с ротацией ключей
+    attempts = max(1, len(api_manager.keys) + 1)
     for attempt in range(attempts):
         try:
             current_key = api_manager.get_current_key()
             if current_key:
-                url = f"https://translation.googleapis.com/language/translate/v2?key={current_key}&q={encoded_text}&source={src_lang}&target={tgt_lang}&format=text"
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    res_data = json.loads(response.read().decode('utf-8'))
-                    translated = res_data.get('data', {}).get('translations', [{}])[0].get('translatedText', '')
-                    if translated:
-                        return translated
-            else:
-                url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    res_data = json.loads(response.read().decode('utf-8'))
-                    result = "".join([item[0] for item in res_data[0] if item[0]])
-                    if result and result.strip():
-                        return result
+                url_v2 = f"https://translation.googleapis.com/language/translate/v2?key={current_key}&q={encoded_text}&source={src_lang}&target={tgt_lang}&format=text"
+                req_v2 = urllib.request.Request(url_v2, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req_v2, timeout=5) as resp_v2:
+                    data_v2 = json.loads(resp_v2.read().decode('utf-8'))
+                    translated_v2 = data_v2.get('data', {}).get('translations', [{}])[0].get('translatedText', '')
+                    if translated_v2:
+                        return translated_v2.strip()
         except urllib.error.HTTPError as e:
             if e.code in [429, 403, 503, 500]:
-                print(f"⚠️ Получена ошибка {e.code} от API. Выполняется ротация ключа...")
                 api_manager.rotate()
-                time.sleep(0.5)
+                time.sleep(0.3)
             else:
                 break
-        except Exception as e:
-            print(f"⚠️ Сетевая ошибка при запросе перевода: {e}. Ротация ключа...")
+        except Exception:
             api_manager.rotate()
             time.sleep(0.3)
             
-    return None
+    return clean_text
 
 
 def process_text_smart(text, direction="en_ru"):
@@ -416,7 +423,7 @@ def process_text_smart(text, direction="en_ru"):
     if not clean_text:
         return text
 
-    # Если строка — чистый номер или базовый код, делаем только конвертацию единиц
+    # Не переводим только чистые числа или технические константы
     if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
         return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru", "az_ru"] else convert_metric_to_imperial_advanced(clean_text)
 
@@ -430,7 +437,7 @@ def process_text_smart(text, direction="en_ru"):
             return convert_metric_to_imperial_advanced(val)
         return val
 
-    # Проверка словаря по точным совпадениям
+    # Проверка пользовательского словаря
     for k in [normalized_key, lower_clean]:
         if k in CUSTOM_DICTIONARY:
             translated = CUSTOM_DICTIONARY[k]
@@ -446,7 +453,7 @@ def process_text_smart(text, direction="en_ru"):
     src_lang, tgt_lang = get_lang_codes(direction)
     result = safe_translate_request(clean_text, src_lang, tgt_lang)
 
-    if not result or not result.strip():
+    if not result or result == clean_text:
         result = translate_via_ollama(clean_text, direction)
 
     if result and result.strip():
