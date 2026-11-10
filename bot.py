@@ -667,9 +667,15 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
             items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
     cells_runs_map = []
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
+    table_cell_count = 0
+    
+    for t_idx, table in enumerate(doc.tables):
+        for r_idx, row in enumerate(table.rows):
+            for c_idx, cell in enumerate(row.cells):
+                table_cell_count += 1
+                cell_text_orig = cell.text.strip()
+                print(f"🔍 [ТАБЛИЦА {t_idx+1} | Ряд {r_idx+1}, Ячейка {c_idx+1}] Исходный текст: '{cell_text_orig}'")
+                
                 for p in cell.paragraphs:
                     for run in p.runs:
                         if run.text.strip():
@@ -678,6 +684,8 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
                     if not p.runs and p.text.strip():
                         cells_runs_map.append(p)
                         items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+
+    print(f"📊 Всего найдено табличных ячеек: {table_cell_count}, текстовых блоков в них для перевода: {len(cells_runs_map)}")
 
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
@@ -694,6 +702,7 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         trans = translated_results[res_idx]
         if trans:
             if hasattr(element, 'text'):
+                print(f"✅ [ЗАПИСЬ В ЯЧЕЙКУ] Переведено: '{element.text}' ➡️ '{trans}'")
                 element.text = trans
 
     dir_path, full_name = os.path.split(input_file)
@@ -701,6 +710,7 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}{ext}")
     doc.save(output_path)
+    print(f"💾 Файл успешно сохранен: {output_path}")
     return output_path
 
 
