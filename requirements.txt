@@ -11,3 +11,4 @@ pdf2docx
 pandas
 pytesseract
 Pillow
+pdfplumber
