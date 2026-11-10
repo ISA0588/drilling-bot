@@ -43,6 +43,11 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 
 try:
+    from pdf2docx import Converter  # Для точного сохранения таблиц, картинок и верстки PDF в Word
+except ImportError:
+    Converter = None
+
+try:
     import pytesseract
     from PIL import Image
 except ImportError:
@@ -774,25 +779,26 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     """
-    Нативный разбор PDF с построением чистой структуры Word и сохранением таблиц 
-    без повреждения разметки сторонними конвертерами.
+    Конвертация PDF в Word через pdf2docx с сохранением всей визуальной разметки, 
+    таблиц, шрифтов, колонок и штампов с последующим точечным переводом содержимого.
     """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
     suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
 
+    total_pages = 1
     try:
-        reader = PdfReader(input_file)
-        total_pages = len(reader.pages)
+        reader_temp = PdfReader(input_file)
+        total_pages = len(reader_temp.pages)
     except Exception:
-        total_pages = 1
+        pass
 
     try:
         progress_text = (
-            f"📄 Чтение структуры PDF и извлечение таблиц...\n"
+            f"📄 Конвертация PDF с сохранением верстки и таблиц...\n"
             f"[░░░░░░░░░░] 0%\n"
-            f"Всего страниц обнаружено: {total_pages}"
+            f"Всего страниц: {total_pages}"
         )
         asyncio.run_coroutine_threadsafe(
             bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
@@ -801,66 +807,77 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
+    # Основной режим с сохранением таблиц и разметки через pdf2docx
+    if Converter is not None:
+        try:
+            cv = Converter(input_file)
+            cv.convert(output_path, start=0, end=None)
+            cv.close()
+            
+            doc = Document(output_path)
+            items_to_translate = []
+            paragraphs_map = []
+            cells_map = []
+            
+            # Собираем все абзацы текста
+            for p in doc.paragraphs:
+                clean_t = p.text.strip()
+                if clean_t:
+                    paragraphs_map.append(p)
+                    items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
+
+            # Собираем все ячейки таблиц для перевода с сохранением сетки
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        clean_t = cell.text.strip()
+                        cells_map.append(cell)
+                        items_to_translate.append({'text': clean_t if clean_t else "", 'index': len(items_to_translate)})
+
+            # Пакетный перевод
+            translated_results = batch_translate_with_progress(
+                items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
+            )
+
+            # Записываем переведенный текст в абзацы
+            para_count = len(paragraphs_map)
+            for idx, p in enumerate(paragraphs_map):
+                trans = translated_results[idx]
+                if trans:
+                    set_paragraph_text_safe(p, trans)
+
+            # Записываем переведенный текст в ячейки таблиц без разрушения их сетки
+            for idx, cell in enumerate(cells_map):
+                res_idx = para_count + idx
+                trans = translated_results[res_idx]
+                if trans is not None:
+                    cell.text = trans
+
+            doc.save(output_path)
+            return output_path
+        except Exception as e:
+            print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
+
+    # Запасной алгоритм, если pdf2docx недоступен
     out_doc = Document()
+    reader = PdfReader(input_file)
     items_to_translate = []
-    extracted_elements = [] # список для хранения пар (тип, объект)
+    lines_list = []
+    for page in reader.pages:
+        txt = page.extract_text()
+        if txt:
+            for line in txt.split('\n'):
+                if line.strip():
+                    lines_list.append(line.strip())
+                    items_to_translate.append({'text': line.strip(), 'index': len(items_to_translate)})
 
-    for page_idx, page in enumerate(reader.pages, 1):
-        text = page.extract_text()
-        if text:
-            # Разбиваем текст страницы на смысловые абзацы/строки
-            lines = [l.strip() for l in text.split('\n') if l.strip()]
-            for line in lines:
-                # Определяем, похоже ли это на элемент таблицы (параметр | значение)
-                if ' | ' in line:
-                    parts = line.split(' | ', 1)
-                    extracted_elements.append(('table_row', parts[0], parts[1]))
-                    items_to_translate.append({'text': parts[0], 'index': len(items_to_translate)})
-                    items_to_translate.append({'text': parts[1], 'index': len(items_to_translate)})
-                else:
-                    extracted_elements.append(('paragraph', line))
-                    items_to_translate.append({'text': line, 'index': len(items_to_translate)})
-
-    # Пакетный перевод всех собранных элементов
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
     )
 
-    # Создаем красивую таблицу в Word для параметров с разделителем |
-    current_table = None
-    for elem in extracted_elements:
-        if elem[0] == 'paragraph':
-            idx = elem[1] # здесь временно индекс или элемент, перепишем аккуратно ниже
-            # Возьмем через сопоставление
-            pass
-
-    # Пересобираем документ с нативной генерацией таблиц и абзацев без поломок
-    global_idx = 0
-    current_table = None
-
-    for elem in extracted_elements:
-        if elem[0] == 'paragraph':
-            orig_text = elem[1]
-            trans = translated_results[global_idx]
-            global_idx += 1
-            out_doc.add_paragraph(trans if trans else orig_text)
-            current_table = None
-        elif elem[0] == 'table_row':
-            key_orig = elem[1]
-            val_orig = elem[2]
-            
-            key_trans = translated_results[global_idx]
-            global_idx += 1
-            val_trans = translated_results[global_idx]
-            global_idx += 1
-
-            if current_table is None:
-                current_table = out_doc.add_table(rows=0, cols=2)
-                current_table.style = 'Table Grid'
-
-            row = current_table.add_row()
-            row.cells[0].text = key_trans if key_trans else key_orig
-            row.cells[1].text = val_trans if val_trans else val_orig
+    for idx, orig in enumerate(lines_list):
+        trans = translated_results[idx]
+        out_doc.add_paragraph(trans if trans else orig)
 
     out_doc.save(output_path)
     return output_path
