@@ -423,7 +423,6 @@ def process_text_smart(text, direction="en_ru"):
     if not clean_text:
         return text
 
-    # Не переводим только чистые числа или технические константы
     if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
         return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru", "az_ru"] else convert_metric_to_imperial_advanced(clean_text)
 
@@ -437,7 +436,6 @@ def process_text_smart(text, direction="en_ru"):
             return convert_metric_to_imperial_advanced(val)
         return val
 
-    # Проверка пользовательского словаря
     for k in [normalized_key, lower_clean]:
         if k in CUSTOM_DICTIONARY:
             translated = CUSTOM_DICTIONARY[k]
@@ -560,12 +558,8 @@ def set_paragraph_text_safe(paragraph, new_text):
 
 
 def set_cell_text_clean(cell, new_text):
-    """Принудительно полностью очищает ячейку таблицы и записывает переведенный текст"""
-    cell.text = ""  # Полная очистка всех блоков и run'ов в ячейке
-    if cell.paragraphs:
-        cell.paragraphs[0].text = new_text
-    else:
-        cell.add_paragraph(new_text)
+    """Принудительно очищает ячейку таблицы целиком и записывает переведенный текст"""
+    cell.text = new_text
 
 
 # ==================== ОБРАБОТКА ФАЙЛОВ ====================
@@ -822,7 +816,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
-    # РЕЖИМ 1: Конвертация через pdf2docx с жесткой очисткой ячеек таблиц
+    # РЕЖИМ 1: Конвертация через pdf2docx с поабзацным переводом и очисткой таблиц
     if Converter is not None:
         try:
             cv = Converter(input_file)
@@ -834,14 +828,14 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             paragraphs_map = []
             cells_map = []
             
-            # Собираем целые абзацы текста (вне таблиц)
+            # Собираем целые абзацы текста
             for p in doc.paragraphs:
                 clean_t = p.text.strip()
                 if clean_t:
                     paragraphs_map.append(p)
                     items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Собираем текст из ячеек таблиц напрямую через cell.text
+            # Собираем текст целиком из ячеек таблиц
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
@@ -850,19 +844,19 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                             cells_map.append(cell)
                             items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Пакетный перевод всего текста
+            # Пакетный перевод текста
             translated_results = batch_translate_with_progress(
                 items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
             )
 
-            # Перезапись текста вне таблиц
+            # Перезапись текста в абзацах
             para_count = len(paragraphs_map)
             for idx, p in enumerate(paragraphs_map):
                 trans = translated_results[idx]
                 if trans:
                     set_paragraph_text_safe(p, trans)
 
-            # Гарантированная перекомпоновка ячеек таблиц через cell.text = ""
+            # Перезапись текста в ячейках таблиц с полной очисткой
             for idx, cell in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
@@ -1183,5 +1177,5 @@ def main():
     web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
 
 
-if __name__ == "__main__":
+if __name__ == "main":
     main()
