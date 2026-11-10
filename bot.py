@@ -559,6 +559,15 @@ def set_paragraph_text_safe(paragraph, new_text):
     paragraph.add_run(new_text)
 
 
+def set_cell_text_clean(cell, new_text):
+    """Принудительно полностью очищает ячейку таблицы и записывает переведенный текст"""
+    cell.text = ""  # Полная очистка всех блоков и run'ов в ячейке
+    if cell.paragraphs:
+        cell.paragraphs[0].text = new_text
+    else:
+        cell.add_paragraph(new_text)
+
+
 # ==================== ОБРАБОТКА ФАЙЛОВ ====================
 def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
@@ -680,10 +689,10 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for p in cell.paragraphs:
-                    if p.text.strip():
-                        cells_map.append(p)
-                        items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+                clean_t = cell.text.strip()
+                if clean_t:
+                    cells_map.append(cell)
+                    items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
@@ -695,11 +704,11 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         if trans:
             set_paragraph_text_safe(p, trans)
 
-    for idx, p in enumerate(cells_map):
+    for idx, cell in enumerate(cells_map):
         res_idx = para_count + idx
         trans = translated_results[res_idx]
         if trans:
-            set_paragraph_text_safe(p, trans)
+            set_cell_text_clean(cell, trans)
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -813,7 +822,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     except Exception:
         pass
 
-    # РЕЖИМ 1: Конвертация через pdf2docx с поабзацным переводом и безопасной заменой
+    # РЕЖИМ 1: Конвертация через pdf2docx с жесткой очисткой ячеек таблиц
     if Converter is not None:
         try:
             cv = Converter(input_file)
@@ -825,41 +834,40 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             paragraphs_map = []
             cells_map = []
             
-            # Собираем целые абзацы текста
+            # Собираем целые абзацы текста (вне таблиц)
             for p in doc.paragraphs:
                 clean_t = p.text.strip()
                 if clean_t:
                     paragraphs_map.append(p)
                     items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Собираем текст из параграфов в ячейках таблиц
+            # Собираем текст из ячеек таблиц напрямую через cell.text
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
-                        for p in cell.paragraphs:
-                            clean_t = p.text.strip()
-                            if clean_t:
-                                cells_map.append(p)
-                                items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
+                        clean_t = cell.text.strip()
+                        if clean_t:
+                            cells_map.append(cell)
+                            items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Пакетный перевод текста
+            # Пакетный перевод всего текста
             translated_results = batch_translate_with_progress(
                 items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
             )
 
-            # Перезапись текста в абзацах
+            # Перезапись текста вне таблиц
             para_count = len(paragraphs_map)
             for idx, p in enumerate(paragraphs_map):
                 trans = translated_results[idx]
                 if trans:
                     set_paragraph_text_safe(p, trans)
 
-            # Перезапись текста в ячейках таблиц
-            for idx, p in enumerate(cells_map):
+            # Гарантированная перекомпоновка ячеек таблиц через cell.text = ""
+            for idx, cell in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
                 if trans:
-                    set_paragraph_text_safe(p, trans)
+                    set_cell_text_clean(cell, trans)
 
             doc.save(output_path)
             return output_path
