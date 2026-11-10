@@ -1,8 +1,8 @@
 """
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
 (Excel, Word, PowerPoint, Text, Markdown, PDF) с надежным пакетным переводом через gtx API, 
-сохранением глоссария, конвертации единиц, распознаванием и переводом текста на изображениях в PDF 
-и интеграцией оплаты через Telegram Stars (10 звезд).
+автоматической ротацией ключей (API_KEY1, API_KEY2...), сохранением глоссария, 
+конвертации единиц и интеграцией оплаты через Telegram Stars (10 звезд).
 """
 
 import os
@@ -18,7 +18,6 @@ from flask import Flask
 import urllib.request
 import urllib.parse
 import json
-import io
 
 import openpyxl
 from docx import Document
@@ -41,19 +40,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery
 
 try:
-    import fitz  # PyMuPDF для продвинутой работы с разметкой и извлечения картинок из PDF
+    import fitz  # PyMuPDF для продвинутой работы с разметкой
 except ImportError:
     fitz = None
 
 try:
-    import pytesseract
-    from PIL import Image
-except ImportError:
-    pytesseract = None
-    Image = None
-
-try:
-    import pdf2docx
     from pdf2docx import Converter  # Для сохранения таблиц, картинок и верстки при конвертации PDF в Word
 except ImportError:
     Converter = None
@@ -68,41 +59,53 @@ BOT_TOKEN = "8965573915:AAFBt0Jqwvis3U7eTcs9EUCfsEq2QhnsFZA"  # <--- Токен 
 DEVELOPER_IDS = {8186927099, 1153214776, 7785086792, 1359780349}  # ID с бесплатным доступом
 STARS_PRICE = 10                          # Стоимость перевода в Telegram Stars
 
-# ==================== ДИНАМИЧЕСКИЙ СБОР БЕЗГРАНИЧНОГО ПУЛА API КЛЮЧЕЙ ====================
-def load_dynamic_api_keys():
-    """
-    Автоматически находит и собирает все ключи вида API_KEY1, API_KEY2, API_KEY3 
-    и т.д. из переменных окружения в неограниченном количестве.
-    """
-    keys_pool = []
-    index = 1
-    while True:
-        key_name = f"API_KEY{index}"
-        key_value = os.getenv(key_name)
-        
-        if not key_value:
-            if index == 1:
-                single_key = os.getenv("API_KEY")
-                if single_key:
-                    keys_pool.append(single_key.strip())
-            break
-            
-        keys_pool.append(key_value.strip())
-        index += 1
-        
-    return keys_pool
 
-# Загружаем пул ключей динамически
-API_KEYS_POOL = load_dynamic_api_keys()
-current_key_index = 0
+# ==================== МЕХАНИЗМ РОТАЦИИ И ОТКАЗОУСТОЙЧИВОСТИ КЛЮЧЕЙ ====================
+class ApiKeyManager:
+    """Менеджер для автоматического поиска и ротации ключей вида API_KEY1, API_KEY2, API_KEY3..."""
+    def __init__(self):
+        self.keys = []
+        self.current_index = 0
+        self.load_keys()
 
-def get_next_api_key():
-    global current_key_index
-    if not API_KEYS_POOL:
-        return None
-    key = API_KEYS_POOL[current_key_index]
-    current_key_index = (current_key_index + 1) % len(API_KEYS_POOL)
-    return key
+    def load_keys(self):
+        self.keys = []
+        # Динамически ищем все переменные окружения вида API_KEY1, API_KEY2, ...
+        i = 1
+        while True:
+            key_name = f"API_KEY{i}"
+            val = os.environ.get(key_name)
+            if val:
+                self.keys.append(val.strip())
+                i += 1
+            else:
+                # Проверяем небольшой запас на случай пропусков (например, пропущен API_KEY2, но есть API_KEY3)
+                # Если 3 раза подряд пусто — прекращаем поиск
+                found_any_ahead = False
+                for j in range(1, 4):
+                    if os.environ.get(f"API_KEY{i + j}"):
+                        found_any_ahead = True
+                        break
+                if not found_any_ahead:
+                    break
+                i += 1
+        print(f"🔄 Загружено резервных API-ключей ротации: {len(self.keys)}")
+
+    def get_current_key(self):
+        if not self.keys:
+            return None
+        return self.keys[self.current_index]
+
+    def rotate(self):
+        if not self.keys:
+            return
+        old_index = self.current_index
+        self.current_index = (self.current_index + 1) % len(self.keys)
+        print(f"⚠️ Ротация API-ключа: переключение с индекса {old_index + 1} на {self.current_index + 1}")
+
+
+# Инициализация глобального менеджера ключей
+api_manager = ApiKeyManager()
 
 
 # Глобальные переменные состояния
@@ -190,35 +193,6 @@ def translate_via_ollama(text, direction="en_ru"):
     return None
 
 
-def translate_via_paid_api(text, src_lang, tgt_lang):
-    """Резервный перевод через официальные API ключи (динамический пул API_KEY*) с ротацией"""
-    if not requests or not API_KEYS_POOL:
-        return None
-    
-    for _ in range(len(API_KEYS_POOL)):
-        api_key = get_next_api_key()
-        if not api_key:
-            break
-        try:
-            url = f"https://translation.googleapis.com/language/v2?key={api_key}"
-            payload = {
-                "q": text,
-                "target": tgt_lang,
-                "source": src_lang if src_lang != 'auto' else None
-            }
-            payload = {k: v for k, v in payload.items() if v is not None}
-            
-            response = requests.post(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                translations = data.get("data", {}).get("translations", [])
-                if translations:
-                    return translations[0].get("translatedText", "")
-        except Exception:
-            continue
-    return None
-
-
 def parse_inch_value(s):
     s = s.strip()
     try:
@@ -303,286 +277,4 @@ def convert_imperial_to_metric_advanced(text):
         except:
             return full_match
 
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*(?:\s*[\/\-]\s*\d+[\d,]*\.?\d*)?)\s*(?:HP|hp)', replace_hp_range, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:Klbs|k-lbs|klbs|kips)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.45359237:.1f} т)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:tons|tonnes)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.907185:.1f} т)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*psi', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.00689476:.1f} МПа)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:ft|фут[а-я]*|feet|foot)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.3048:.1f} м)", res, flags=re.IGNORECASE)
-    
-    def replace_inch(m):
-        parsed = parse_inch_value(m.group(2))
-        if parsed is not None:
-            return f"{m.group(0)} (~{parsed * 25.4:.1f} мм)"
-        return m.group(0)
-        
-    res = re.sub(r'([+\-±]+)?\s*(\d+(?:[\s\-.]\d+\/\d+|[.,]\d+|\/\d+)?)\s*(?:in|inch|["″]|дюйм[а-я]*)', replace_inch, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:bbls|bbl|barrels|баррел[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.158987:.1f} м³)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:kl|kL|kiloliters|килолитр[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',','')):.1f} м³)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:gal|gallons)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*3.78541:.1f} л)", res, flags=re.IGNORECASE)
-    return res
-
-
-def convert_metric_to_imperial_advanced(text):
-    if not isinstance(text, str):
-        return text
-    res = text
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:Н[·\.]м|Nm|N\s*m)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.737562:.1f} ft-lb)", res, flags=re.IGNORECASE)
-    
-    def replace_metric_tons(m):
-        full_match = m.group(0)
-        try:
-            val = float(m.group(2).replace(',', ''))
-            lbs_val = val / 0.00045359237
-            klbs_val = val / 0.45359237
-            if klbs_val >= 1:
-                return f"{full_match} (~{klbs_val:.1f} Klbs / {lbs_val:,.0f} lbs)"
-            else:
-                return f"{full_match} (~{lbs_val:.0f} lbs)"
-        except:
-            return full_match
-
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:т|тонн[а-я]*)', replace_metric_tons, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:МПа|MPa)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/0.00689476:.0f} psi)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:м\b|метров|metres|meters|meter)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/0.3048:.1f} ft)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:мм\b|mm)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/25.4:.2f} in)", res, flags=re.IGNORECASE)
-    return res
-
-
-def process_text_smart(text, direction="en_ru"):
-    if not isinstance(text, str):
-        return text
-    
-    clean_text = text.strip()
-    if not clean_text:
-        return text
-
-    if re.match(r'^(API|ISO|ГОСТ|ТУ|ANSI|ASME|DIN|EN)\s*[\d\-]+[A-Za-zА-Яа-я]*$', clean_text, re.IGNORECASE):
-        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
-
-    if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
-        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru"] else convert_metric_to_imperial_advanced(clean_text)
-
-    lower_clean = clean_text.lower()
-    normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
-
-    def apply_units(val):
-        if direction in ["en_ru", "en_zh_ru"]:
-            return convert_imperial_to_metric_advanced(val)
-        elif direction in ["ru_en", "ru_az", "az_ru"]:
-            return convert_metric_to_imperial_advanced(val)
-        return val
-
-    for k in [normalized_key, lower_clean]:
-        if k in CUSTOM_DICTIONARY:
-            translated = CUSTOM_DICTIONARY[k]
-            if clean_text.isupper() and len(clean_text) > 1:
-                translated = translated.upper()
-            return apply_units(translated)
-
-    if CUSTOM_DICTIONARY:
-        keys_list = list(CUSTOM_DICTIONARY.keys())
-        matches = difflib.get_close_matches(normalized_key, keys_list, n=1, cutoff=0.85)
-        if matches:
-            matched_key = matches[0]
-            translated = CUSTOM_DICTIONARY[matched_key]
-            if clean_text.isupper() and len(clean_text) > 1:
-                translated = translated.upper()
-            return apply_units(translated)
-
-    cache_key = f"{direction}_{normalized_key}"
-    if cache_key in TRANSLATION_CACHE:
-        translated = TRANSLATION_CACHE[cache_key]
-        return apply_units(translated)
-
-    # Выбор языковой пары для API
-    if direction == 'en_zh_ru':
-        src_lang, tgt_lang = 'auto', 'ru'
-    elif direction == 'en_ru':
-        src_lang, tgt_lang = 'en', 'ru'
-    elif direction == 'ru_en':
-        src_lang, tgt_lang = 'ru', 'en'
-    elif direction == 'ru_az':
-        src_lang, tgt_lang = 'ru', 'az'
-    elif direction == 'az_ru':
-        src_lang, tgt_lang = 'az', 'ru'
-    else:
-        src_lang, tgt_lang = 'auto', 'ru'
-
-    # Одиночный перевод через gtx API с переключением на резервные ключи при ошибке
-    result = None
-    try:
-        encoded_text = urllib.parse.quote(clean_text)
-        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            res_data = json.loads(response.read().decode('utf-8'))
-            result = "".join([item[0] for item in res_data[0] if item[0]])
-    except Exception:
-        result = translate_via_paid_api(clean_text, src_lang, tgt_lang)
-
-    if not result or not result.strip():
-        result = translate_via_ollama(clean_text, direction)
-
-    if result and result.strip():
-        clean_result = result.strip()
-        TRANSLATION_CACHE[cache_key] = clean_result
-        return apply_units(clean_result)
-    else:
-        log_untranslated_term(clean_text)
-
-    return apply_units(clean_result)
-
-
-# ==================== РАСПОЗНАВАНИЕ И ПЕРЕВОД ТЕКСТА С КАРТИНОК В PDF (OCR) ====================
-def extract_and_translate_image_text(pdf_path, direction="en_ru"):
-    """
-    Извлекает все изображения из PDF-документа, распознает на них текст с помощью Tesseract OCR 
-    и возвращает список переведенных блоков текста для добавления в общий документ.
-    """
-    translated_image_texts = []
-    if not fitz or not pytesseract or not Image:
-        return translated_image_texts
-    
-    try:
-        doc = fitz.open(pdf_path)
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            image_list = page.get_images(full=True)
-            for img_index, img in enumerate(image_list):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                
-                try:
-                    image = Image.open(io.BytesIO(image_bytes))
-                    ocr_text = pytesseract.image_to_string(image, lang='eng+rus+aze')
-                    if ocr_text and ocr_text.strip():
-                        translated_ocr = process_text_smart(ocr_text.strip(), direction)
-                        if translated_ocr:
-                            translated_image_texts.append(
-                                f"\n--- [Распознано с изображения №{img_index + 1} на стр. {page_num + 1}] ---\n{translated_ocr}\n----------------------------------------------------\n"
-                            )
-                except Exception as img_err:
-                    print(f"Ошибка OCR изображения {img_index} на странице {page_num}: {img_err}")
-    except Exception as e:
-        print(f"Ошибка открытия PDF для OCR: {e}")
-        
-    return translated_image_texts
-
-
-# ==================== НАДЕЖНЫЙ ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ЧЕРЕЗ GTX API ====================
-def batch_translate_texts(texts_list, direction="en_ru"):
-    """Надежный пакетный перевод строк через прямой запрос к публичному API Google Translate с защитой от лимитов и переключением на ключи"""
-    if not texts_list:
-        return []
-    
-    results = [None] * len(texts_list)
-    uncached_indices = []
-    uncached_texts = []
-
-    for i, text in enumerate(texts_list):
-        if not isinstance(text, str) or not text.strip():
-            results[i] = text
-            continue
-        
-        clean_text = text.strip()
-        lower_clean = clean_text.lower()
-        normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
-        
-        # Проверка словаря
-        found = False
-        for k in [normalized_key, lower_clean]:
-            if k in CUSTOM_DICTIONARY:
-                tr = CUSTOM_DICTIONARY[k]
-                if clean_text.isupper() and len(clean_text) > 1:
-                    tr = tr.upper()
-                results[i] = tr
-                found = True
-                break
-        if found:
-            continue
-
-        # Проверка кэша
-        cache_key = f"{direction}_{normalized_key}"
-        if cache_key in TRANSLATION_CACHE:
-            results[i] = TRANSLATION_CACHE[cache_key]
-        else:
-            uncached_indices.append(i)
-            uncached_texts.append(clean_text)
-
-    if not uncached_texts:
-        return results
-
-    # Выбор языковой пары
-    if direction == 'en_zh_ru':
-        src_lang, tgt_lang = 'auto', 'ru'
-    elif direction == 'en_ru':
-        src_lang, tgt_lang = 'en', 'ru'
-    elif direction == 'ru_en':
-        src_lang, tgt_lang = 'ru', 'en'
-    elif direction == 'ru_az':
-        src_lang, tgt_lang = 'ru', 'az'
-    elif direction == 'az_ru':
-        src_lang, tgt_lang = 'az', 'ru'
-    else:
-        src_lang, tgt_lang = 'auto', 'ru'
-
-    # Пакетная отправка с защитой и fallback на API ключи
-    batch_size = 50
-    for start_idx in range(0, len(uncached_texts), batch_size):
-        chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
-        chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
-        
-        translated_chunk = []
-        api_success = False
-
-        # Сначала пробуем пакетно через gtx
-        try:
-            combined_text = "\n[|||]\n".join(chunk_texts)
-            encoded_text = urllib.parse.quote(combined_text)
-            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                res_data = json.loads(response.read().decode('utf-8'))
-                full_translated = "".join([item[0] for item in res_data[0] if item[0]])
-                translated_chunk = [t.strip() for t in full_translated.split("[|||]")]
-                if len(translated_chunk) == len(chunk_texts):
-                    api_success = True
-        except Exception:
-            api_success = False
-
-        if not api_success:
-            for text in chunk_texts:
-                res = translate_via_paid_api(text, src_lang, tgt_lang)
-                if not res:
-                    res = translate_via_ollama(text, direction)
-                if not res:
-                    res = text
-                translated_chunk.append(res)
-
-        for original_idx, tr_text in zip(chunk_indices, translated_chunk):
-            if tr_text:
-                clean_tr = tr_text.strip()
-                results[original_idx] = clean_tr
-                c_key = f"{direction}_{re.sub(r'[^\\w\\s]', '', uncached_texts[uncached_indices.index(original_idx)].lower()).strip()}"
-                TRANSLATION_CACHE[c_key] = clean_tr
-            else:
-                results[original_idx] = uncached_texts[uncached_indices.index(original_idx)]
-
-    return results
-
-
-# ==================== ФОНОВЫЙ FLASK-СЕРВЕР ДЛЯ RENDER PORT BINDING ====================
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Bot is running!"
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-if __name__ == "__main__":
-    server_thread = threading.Thread(target=run_web_server, daemon=True)
-    server_thread.start()
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*(?:\s*[\/\-]\s
