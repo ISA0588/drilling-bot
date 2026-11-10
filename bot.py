@@ -463,4 +463,126 @@ def extract_and_translate_image_text(pdf_path, direction="en_ru"):
                                 f"\n--- [Распознано с изображения №{img_index + 1} на стр. {page_num + 1}] ---\n{translated_ocr}\n----------------------------------------------------\n"
                             )
                 except Exception as img_err:
-                    print(f"Ошибка OCR изображения {img_index} на странице {page_num}: {img
+                    print(f"Ошибка OCR изображения {img_index} на странице {page_num}: {img_err}")
+    except Exception as e:
+        print(f"Ошибка открытия PDF для OCR: {e}")
+        
+    return translated_image_texts
+
+
+# ==================== НАДЕЖНЫЙ ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ЧЕРЕЗ GTX API ====================
+def batch_translate_texts(texts_list, direction="en_ru"):
+    """Надежный пакетный перевод строк через прямой запрос к публичному API Google Translate с защитой от лимитов и переключением на ключи"""
+    if not texts_list:
+        return []
+    
+    results = [None] * len(texts_list)
+    uncached_indices = []
+    uncached_texts = []
+
+    for i, text in enumerate(texts_list):
+        if not isinstance(text, str) or not text.strip():
+            results[i] = text
+            continue
+        
+        clean_text = text.strip()
+        lower_clean = clean_text.lower()
+        normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
+        
+        # Проверка словаря
+        found = False
+        for k in [normalized_key, lower_clean]:
+            if k in CUSTOM_DICTIONARY:
+                tr = CUSTOM_DICTIONARY[k]
+                if clean_text.isupper() and len(clean_text) > 1:
+                    tr = tr.upper()
+                results[i] = tr
+                found = True
+                break
+        if found:
+            continue
+
+        # Проверка кэша
+        cache_key = f"{direction}_{normalized_key}"
+        if cache_key in TRANSLATION_CACHE:
+            results[i] = TRANSLATION_CACHE[cache_key]
+        else:
+            uncached_indices.append(i)
+            uncached_texts.append(clean_text)
+
+    if not uncached_texts:
+        return results
+
+    # Выбор языковой пары
+    if direction == 'en_zh_ru':
+        src_lang, tgt_lang = 'auto', 'ru'
+    elif direction == 'en_ru':
+        src_lang, tgt_lang = 'en', 'ru'
+    elif direction == 'ru_en':
+        src_lang, tgt_lang = 'ru', 'en'
+    elif direction == 'ru_az':
+        src_lang, tgt_lang = 'ru', 'az'
+    elif direction == 'az_ru':
+        src_lang, tgt_lang = 'az', 'ru'
+    else:
+        src_lang, tgt_lang = 'auto', 'ru'
+
+    # Пакетная отправка с защитой и fallback на API ключи
+    batch_size = 50
+    for start_idx in range(0, len(uncached_texts), batch_size):
+        chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
+        chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
+        
+        translated_chunk = []
+        api_success = False
+
+        # Сначала пробуем пакетно через gtx
+        try:
+            combined_text = "\n[|||]\n".join(chunk_texts)
+            encoded_text = urllib.parse.quote(combined_text)
+            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                res_data = json.loads(response.read().decode('utf-8'))
+                full_translated = "".join([item[0] for item in res_data[0] if item[0]])
+                translated_chunk = [t.strip() for t in full_translated.split("[|||]")]
+                if len(translated_chunk) == len(chunk_texts):
+                    api_success = True
+        except Exception:
+            api_success = False
+
+        if not api_success:
+            for text in chunk_texts:
+                res = translate_via_paid_api(text, src_lang, tgt_lang)
+                if not res:
+                    res = translate_via_ollama(text, direction)
+                if not res:
+                    res = text
+                translated_chunk.append(res)
+
+        for original_idx, tr_text in zip(chunk_indices, translated_chunk):
+            if tr_text:
+                clean_tr = tr_text.strip()
+                results[original_idx] = clean_tr
+                c_key = f"{direction}_{re.sub(r'[^\\w\\s]', '', uncached_texts[uncached_indices.index(original_idx)].lower()).strip()}"
+                TRANSLATION_CACHE[c_key] = clean_tr
+            else:
+                results[original_idx] = uncached_texts[uncached_indices.index(original_idx)]
+
+    return results
+
+
+# ==================== ФОНОВЫЙ FLASK-СЕРВЕР ДЛЯ RENDER PORT BINDING ====================
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Bot is running!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
