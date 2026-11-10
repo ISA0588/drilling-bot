@@ -1145,8 +1145,13 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
 
 # ==================== WEBHOOK СЕРВЕР НА AIOHTTP ДЛЯ RENDER ====================
 async def on_startup(bot: Bot):
-    # При запуске сервера подставляем адрес вебхука в Telegram API
     if WEBHOOK_HOST:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            print("🗑️ Предыдущий вебхук успешно удален.")
+        except Exception as e:
+            print(f"⚠️ Ошибка при удалении вебхука: {e}")
+            
         await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
         print(f"🔗 Вебхук успешно зарегистрирован в Telegram: {WEBHOOK_URL}")
     else:
@@ -1162,18 +1167,15 @@ def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Регистрация хука на запуск
     dp.startup.register(on_startup)
 
     app = web.Application()
 
-    # Health-check маршрут для проверок Render
     async def health_check(request):
         return web.Response(text="Bot is running via Webhook!")
 
     app.router.add_get("/", health_check)
 
-    # Обработчик запросов Webhook от Telegram
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
