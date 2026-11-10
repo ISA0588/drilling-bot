@@ -673,10 +673,9 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for p in cell.paragraphs:
-                    if p.text.strip():
-                        cells_map.append(p)
-                        items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+                clean_t = cell.text.strip()
+                cells_map.append(cell)
+                items_to_translate.append({'text': clean_t if clean_t else "", 'index': len(items_to_translate)})
 
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
@@ -688,11 +687,11 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         if trans:
             set_paragraph_text_safe(p, trans)
 
-    for idx, cell_p in enumerate(cells_map):
+    for idx, cell in enumerate(cells_map):
         res_idx = para_count + idx
         trans = translated_results[res_idx]
-        if trans:
-            set_paragraph_text_safe(cell_p, trans)
+        if trans is not None and trans.strip():
+            cell.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -774,8 +773,7 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     """
-    Конвертация PDF в Word через pdf2docx с гарантированным проходом по всем ячейкам таблиц 
-    и полным переводом их содержимого.
+    Конвертация PDF в Word через pdf2docx с прямым доступом и пакетным переводом ячеек таблиц.
     """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -819,15 +817,13 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                     paragraphs_map.append(p)
                     items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Принудительно собираем ВСЕ ячейки таблиц
+            # Прямой сбор ячеек таблиц по их полному тексту
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
-                        for p in cell.paragraphs:
-                            clean_t = p.text.strip()
-                            if clean_t:
-                                cells_map.append(p)
-                                items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
+                        clean_t = cell.text.strip()
+                        cells_map.append(cell)
+                        items_to_translate.append({'text': clean_t if clean_t else "", 'index': len(items_to_translate)})
 
             translated_results = batch_translate_with_progress(
                 items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
@@ -839,12 +835,12 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                 if trans:
                     set_paragraph_text_safe(p, trans)
 
-            # Переводим текст внутри ячеек таблиц
-            for idx, cell_p in enumerate(cells_map):
+            # Прямая запись перевода в ячейки таблиц
+            for idx, cell in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
-                if trans:
-                    set_paragraph_text_safe(cell_p, trans)
+                if trans is not None and trans.strip():
+                    cell.text = trans
 
             doc.save(output_path)
             return output_path
