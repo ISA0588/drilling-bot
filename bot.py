@@ -673,7 +673,6 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                # Безопасно собираем параграфы внутри ячейки таблицы
                 for p in cell.paragraphs:
                     if p.text.strip():
                         cells_map.append(p)
@@ -775,8 +774,8 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     """
-    Конвертация PDF в Word через pdf2docx с точным обходом ячеек таблиц через их параграфы, 
-    чтобы гарантированно сохранить сетку, границы, шрифты и угловые штампы.
+    Конвертация PDF в Word через pdf2docx с точным обходом параграфов внутри ячеек таблиц, 
+    чтобы гарантированно переводить текст внутри таблиц без потери структуры и сетки.
     """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -814,14 +813,13 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             paragraphs_map = []
             cells_map = []
             
-            # Собираем обычные абзацы
             for p in doc.paragraphs:
                 clean_t = p.text.strip()
                 if clean_t:
                     paragraphs_map.append(p)
                     items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Собираем параграфы внутри ячеек таблиц (сохраняет сетку таблиц и штампы)
+            # Собираем параграфы внутри ячеек таблиц для перевода
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
@@ -831,19 +829,16 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                                 cells_map.append(p)
                                 items_to_translate.append({'text': clean_t, 'index': len(items_to_translate)})
 
-            # Пакетный перевод
             translated_results = batch_translate_with_progress(
                 items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
             )
 
-            # Записываем переведенный текст в абзацы
             para_count = len(paragraphs_map)
             for idx, p in enumerate(paragraphs_map):
                 trans = translated_results[idx]
                 if trans:
                     set_paragraph_text_safe(p, trans)
 
-            # Записываем переведенный текст в ячейки таблиц через их параграфы (без удаления сетки)
             for idx, cell_p in enumerate(cells_map):
                 res_idx = para_count + idx
                 trans = translated_results[res_idx]
