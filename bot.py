@@ -416,9 +416,7 @@ def process_text_smart(text, direction="en_ru"):
     if not clean_text:
         return text
 
-    if re.match(r'^(API|ISO|ГОСТ|ТУ|ANSI|ASME|DIN|EN)\s*[\d\-]+[A-Za-zА-Яа-я]*$', clean_text, re.IGNORECASE):
-        return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru", "az_ru"] else convert_metric_to_imperial_advanced(clean_text)
-
+    # Если строка — чистый номер или базовый код, делаем только конвертацию единиц
     if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
         return convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru", "az_ru"] else convert_metric_to_imperial_advanced(clean_text)
 
@@ -432,19 +430,10 @@ def process_text_smart(text, direction="en_ru"):
             return convert_metric_to_imperial_advanced(val)
         return val
 
+    # Проверка словаря по точным совпадениям
     for k in [normalized_key, lower_clean]:
         if k in CUSTOM_DICTIONARY:
             translated = CUSTOM_DICTIONARY[k]
-            if clean_text.isupper() and len(clean_text) > 1:
-                translated = translated.upper()
-            return apply_units(translated)
-
-    if CUSTOM_DICTIONARY:
-        keys_list = list(CUSTOM_DICTIONARY.keys())
-        matches = difflib.get_close_matches(normalized_key, keys_list, n=1, cutoff=0.85)
-        if matches:
-            matched_key = matches[0]
-            translated = CUSTOM_DICTIONARY[matched_key]
             if clean_text.isupper() and len(clean_text) > 1:
                 translated = translated.upper()
             return apply_units(translated)
@@ -508,42 +497,36 @@ def batch_translate_texts(texts_list, direction="en_ru"):
         uncached_indices.append(i)
         uncached_texts.append(clean_text)
 
-    if not uncached_texts:
-        return results
-
-    src_lang, tgt_lang = get_lang_codes(direction)
-    
-    batch_size = 10
-    for start_idx in range(0, len(uncached_texts), batch_size):
-        chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
-        chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
-        
-        for idx_in_chunk, single_text in enumerate(chunk_texts):
-            orig_idx = chunk_indices[idx_in_chunk]
-            translated_sentence = safe_translate_request(single_text, src_lang, tgt_lang)
+    if uncached_texts:
+        src_lang, tgt_lang = get_lang_codes(direction)
+        batch_size = 10
+        for start_idx in range(0, len(uncached_texts), batch_size):
+            chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
+            chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
             
-            if translated_sentence and translated_sentence.strip():
-                clean_res = translated_sentence.strip()
-                results[orig_idx] = clean_res
-                norm_k = re.sub(r'[^\w\s]', '', single_text.lower()).strip()
-                TRANSLATION_CACHE[f"{direction}_{norm_k}"] = clean_res
-            else:
-                results[orig_idx] = single_text
+            for idx_in_chunk, single_text in enumerate(chunk_texts):
+                orig_idx = chunk_indices[idx_in_chunk]
+                translated_sentence = safe_translate_request(single_text, src_lang, tgt_lang)
                 
-        time.sleep(0.1)
+                if translated_sentence and translated_sentence.strip():
+                    clean_res = translated_sentence.strip()
+                    results[orig_idx] = clean_res
+                    norm_k = re.sub(r'[^\w\s]', '', single_text.lower()).strip()
+                    TRANSLATION_CACHE[f"{direction}_{norm_k}"] = clean_res
+                else:
+                    results[orig_idx] = single_text
+                    
+            time.sleep(0.1)
 
     final_results = []
     for i, res in enumerate(results):
-        if res is not None:
-            # Конвертация единиц для направлений на русский язык
-            if direction in ["en_ru", "en_zh_ru", "az_ru"]:
-                final_results.append(convert_imperial_to_metric_advanced(res))
-            elif direction in ["ru_en", "ru_az"]:
-                final_results.append(convert_metric_to_imperial_advanced(res))
-            else:
-                final_results.append(res)
+        target_val = res if res is not None else texts_list[i]
+        if direction in ["en_ru", "en_zh_ru", "az_ru"]:
+            final_results.append(convert_imperial_to_metric_advanced(target_val))
+        elif direction in ["ru_en", "ru_az"]:
+            final_results.append(convert_metric_to_imperial_advanced(target_val))
         else:
-            final_results.append(texts_list[i])
+            final_results.append(target_val)
             
     return final_results
 
