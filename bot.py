@@ -780,6 +780,35 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     suffix = get_file_suffix(direction)
     output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
 
+    # Предварительный подсчет страниц для визуализации
+    total_pages = 0
+    if fitz is not None:
+        try:
+            doc_pdf_temp = fitz.open(input_file)
+            total_pages = len(doc_pdf_temp)
+            doc_pdf_temp.close()
+        except:
+            pass
+    if total_pages == 0:
+        try:
+            reader_temp = PdfReader(input_file)
+            total_pages = len(reader_temp.pages)
+        except:
+            total_pages = 1
+
+    try:
+        progress_text = (
+            f"📄 Анализ PDF документа...\n"
+            f"[░░░░░░░░░░] 0%\n"
+            f"Всего страниц обнаружено: {total_pages}"
+        )
+        asyncio.run_coroutine_threadsafe(
+            bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+            main_loop
+        )
+    except Exception:
+        pass
+
     if Converter is not None:
         try:
             cv = Converter(input_file)
@@ -846,12 +875,42 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
                 items_to_translate.append({'text': line, 'index': len(items_to_translate)})
                 page_lines_map.append((out_doc, line))
 
-    translated_results = batch_translate_with_progress(
-        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PDF"
-    )
+    # Пакетный перевод с живым обновлением прогресса страниц
+    total = len(items_to_translate)
+    results = [None] * total
+    batch_size = 15
+    processed_count = 0
+    last_update_time = 0
+
+    for i in range(0, total, batch_size):
+        chunk_items = items_to_translate[i:i + batch_size]
+        texts = [item['text'] for item in chunk_items]
+        translated_texts = batch_translate_texts(texts, direction)
+
+        for item, trans in zip(chunk_items, translated_texts):
+            results[item['index']] = trans
+            processed_count += 1
+
+        if total > 0 and (time.time() - last_update_time > 1.5 or processed_count == total):
+            percent = int((processed_count / total) * 100)
+            bar_filled = "█" * (percent // 10)
+            bar_empty = "░" * (10 - (percent // 10))
+            progress_text = (
+                f"⏳ Идет перевод PDF документа...\n"
+                f"[{bar_filled}{bar_empty}] {percent}%\n"
+                f"Обработано строк: {processed_count} из {total} (Всего страниц: {total_pages})"
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+                    main_loop
+                )
+            except Exception:
+                pass
+            last_update_time = time.time()
 
     for idx, (doc_obj, orig_line) in enumerate(page_lines_map):
-        trans = translated_results[idx]
+        trans = results[idx]
         doc_obj.add_paragraph(trans if trans else orig_line)
 
     out_doc.save(output_path)
