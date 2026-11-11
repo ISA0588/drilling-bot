@@ -669,7 +669,7 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
                 xml_runs_map.append(run)
                 items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
-    # 2. Сбор всех таблиц через XML (находит 100% текста в ячейках сложных таблиц)
+    # 2. Сбор из всех таблиц (включая сложные, вложенные и объединенные ячейки)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -677,10 +677,11 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
                     for run in p.runs:
                         text = run.text.strip()
                         if text:
-                            xml_runs_map.append(run)
-                            items_to_translate.append({'text': text, 'index': len(items_to_translate)})
-                            
-    # 3. Сбор из текстовых полей / фреймов (txbxContent), если они есть в конвертированных из PDF файлах
+                            if run not in xml_runs_map:
+                                xml_runs_map.append(run)
+                                items_to_translate.append({'text': text, 'index': len(items_to_translate)})
+
+    # 3. Сбор из текстовых полей / фреймов (txbxContent), если они есть в конвертированных файлах
     for shape in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}txbxContent'):
         for p_elem in shape.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
             from docx.text.paragraph import Paragraph
@@ -688,8 +689,9 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
             for run in p.runs:
                 text = run.text.strip()
                 if text:
-                    xml_runs_map.append(run)
-                    items_to_translate.append({'text': text, 'index': len(items_to_translate)})
+                    if run not in xml_runs_map:
+                        xml_runs_map.append(run)
+                        items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
     # Пакетный перевод всех собранных текстовых фрагментов разом
     translated_results = batch_translate_with_progress(
