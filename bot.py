@@ -667,18 +667,19 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
             paragraphs_map.append(p)
             items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
-    # 2. Абсолютный обход каждой ячейки во всех таблицах Word
-    cells_paragraphs_map = []
+    # 2. Низкоуровневый обход всех текстовых фрагментов (runs) внутри ячеек таблиц
+    cell_runs_map = []
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
-                    text = p.text.strip()
-                    if text:
-                        cells_paragraphs_map.append(p)
-                        items_to_translate.append({'text': text, 'index': len(items_to_translate)})
+                    for run in p.runs:
+                        text = run.text.strip()
+                        if text:
+                            cell_runs_map.append(run)
+                            items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
-    # Пакетный перевод всех собранных элементов (и абзацев, и ячеек) разом
+    # Пакетный перевод всех собранных элементов разом
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
     )
@@ -690,12 +691,12 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         if trans:
             set_paragraph_text_safe(p, trans)
 
-    # Применение перевода к ячейкам таблиц
-    for idx, p in enumerate(cells_paragraphs_map):
+    # Применение перевода к текстовым фрагментам (runs) внутри ячеек таблиц
+    for idx, run in enumerate(cell_runs_map):
         res_idx = para_count + idx
         trans = translated_results[res_idx]
         if trans:
-            set_paragraph_text_safe(p, trans)
+            run.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
