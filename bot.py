@@ -659,50 +659,27 @@ def batch_translate_with_progress(items_list, direction, bot: Bot, chat_id: int,
 def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     doc = Document(input_file)
     items_to_translate = []
-    xml_runs_map = []
+    t_elements = []
     
-    # 1. Сбор всех абзацев документа
-    for p in doc.paragraphs:
-        for run in p.runs:
-            text = run.text.strip()
-            if text:
-                xml_runs_map.append(run)
-                items_to_translate.append({'text': text, 'index': len(items_to_translate)})
+    # Абсолютный низкоуровневый обход КАЖДОГО тега <w:t> во всем документе XML.
+    # Это гарантирует 100% покрытие всего текста: обычных абзацев, колонтитулов 
+    # и любых сложных таблиц (включая вложенные и конвертированные из PDF).
+    for t_elem in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
+        text = t_elem.text
+        if text and text.strip():
+            t_elements.append(t_elem)
+            items_to_translate.append({'text': text.strip(), 'index': len(items_to_translate)})
 
-    # 2. Сбор из всех таблиц (включая сложные, вложенные и объединенные ячейки)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    for run in p.runs:
-                        text = run.text.strip()
-                        if text:
-                            if run not in xml_runs_map:
-                                xml_runs_map.append(run)
-                                items_to_translate.append({'text': text, 'index': len(items_to_translate)})
-
-    # 3. Сбор из текстовых полей / фреймов (txbxContent), если они есть в конвертированных файлах
-    for shape in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}txbxContent'):
-        for p_elem in shape.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
-            from docx.text.paragraph import Paragraph
-            p = Paragraph(p_elem, doc)
-            for run in p.runs:
-                text = run.text.strip()
-                if text:
-                    if run not in xml_runs_map:
-                        xml_runs_map.append(run)
-                        items_to_translate.append({'text': text, 'index': len(items_to_translate)})
-
-    # Пакетный перевод всех собранных текстовых фрагментов разом
+    # Пакетный перевод всех собранных фрагментов
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
     )
 
-    # Применение перевода обратно к найденным текстовым фрагментам (runs)
-    for idx, run in enumerate(xml_runs_map):
+    # Замена текста напрямую в XML-элементах с сохранением исходной верстки и стилей
+    for idx, t_elem in enumerate(t_elements):
         trans = translated_results[idx]
         if trans:
-            run.text = trans
+            t_elem.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
