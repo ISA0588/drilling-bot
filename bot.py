@@ -363,9 +363,14 @@ def ocr_image_bytes(img_bytes, direction="en_ru"):
 
 # ==================== ОТКАЗОУСТОЙЧИВЫЙ СЕТЕВОЙ ПЕРЕВОДЧИК ====================
 def safe_translate_request(clean_text, src_lang, tgt_lang):
-    """Надежный прямой запрос к переводчику Google с поддержкой всех языков"""
+    """Надежный прямой запрос к переводчику Google с очисткой HTML-тегов"""
     if not clean_text or not clean_text.strip():
         return clean_text
+
+    # Очистка мусорных HTML-тегов, появляющихся при конвертации PDF
+    clean_text = re.sub(r'<[^>]+>', '', clean_text).strip()
+    if not clean_text:
+        return ""
 
     encoded_text = urllib.parse.quote(clean_text)
     
@@ -667,15 +672,22 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
             paragraphs_map.append(p)
             items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
-    # 2. Классический глубокий обход таблиц (Nested Loops) по ячейкам и абзацам
-    cells_paragraphs_map = []
+    # 2. Глубокий пофрагментный обход ячеек и параграфов таблиц
+    table_elements_map = []
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
-                    if p.text.strip():
-                        cells_paragraphs_map.append(p)
-                        items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+                    # Проверяем наличие отдельных текстов в runs
+                    if p.runs:
+                        for run in p.runs:
+                            if run.text.strip():
+                                table_elements_map.append(run)
+                                items_to_translate.append({'text': run.text, 'index': len(items_to_translate)})
+                    else:
+                        if p.text.strip():
+                            table_elements_map.append(p)
+                            items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
     # Пакетный перевод всех собранных элементов разом
     translated_results = batch_translate_with_progress(
@@ -689,12 +701,13 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         if trans:
             set_paragraph_text_safe(p, trans)
 
-    # Применение перевода к абзацам внутри таблиц
-    for idx, p in enumerate(cells_paragraphs_map):
+    # Применение перевода к элементам таблиц
+    for idx, element in enumerate(table_elements_map):
         res_idx = para_count + idx
         trans = translated_results[res_idx]
         if trans:
-            set_paragraph_text_safe(p, trans)
+            if hasattr(element, 'text'):
+                element.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -809,7 +822,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             cv.convert(output_path, start=0, end=None)
             cv.close()
             
-            # Обрабатываем полученный документ через нашу глубокую функцию вордовских таблиц
+            # Обрабатываем полученный документ через обновленную функцию вордовских таблиц
             return process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
