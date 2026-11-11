@@ -784,25 +784,18 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     """
-    Конвертация PDF в Word через pdf2docx с сохранением структуры, а затем 
-    глубокий покомпонентный перевод текста таблиц и абзацев.
+    Конвертация PDF в Word через pdf2docx, а затем отправка полученного docx 
+    на глубокий покомпонентный перевод таблиц и текста.
     """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    suffix = get_file_suffix(direction)
-    output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
-
-    try:
-        reader_temp = PdfReader(input_file)
-        total_pages = len(reader_temp.pages)
-    except Exception:
-        total_pages = 1
+    output_path = os.path.join(dir_path, f"{name}_RU.docx")
 
     try:
         progress_text = (
             f"📄 Конвертация PDF с сохранением таблиц и структуры...\n"
             f"[░░░░░░░░░░] 0%\n"
-            f"Всего страниц: {total_pages}"
+            f"Обработка документов..."
         )
         asyncio.run_coroutine_threadsafe(
             bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
@@ -817,6 +810,7 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             cv.convert(output_path, start=0, end=None)
             cv.close()
             
+            # Передаем полученный docx в детальный обработчик таблиц
             return process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
