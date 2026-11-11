@@ -660,24 +660,31 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     doc = Document(input_file)
     items_to_translate = []
     
-    # 1. Сбор абзацев вне таблиц
+    # 1. Сбор обычных абзацев вне таблиц
     paragraphs_map = []
     for p in doc.paragraphs:
         if p.text.strip():
             paragraphs_map.append(p)
             items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
-    # 2. Классический глубокий обход таблиц (Nested Loops) по ячейкам и абзацам
-    cells_paragraphs_map = []
+    # 2. Интеллектуальный обход таблиц с поддержкой вложенных структур и разделителей ' | '
+    cell_elements_map = []
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
-                    if p.text.strip():
-                        cells_paragraphs_map.append(p)
-                        items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+                    text = p.text.strip()
+                    if text:
+                        if " | " in text:
+                            parts = text.split(" | ", 1)
+                            cell_elements_map.append((p, 'split', parts[0], parts[1]))
+                            items_to_translate.append({'text': parts[0], 'index': len(items_to_translate)})
+                            items_to_translate.append({'text': parts[1], 'index': len(items_to_translate)})
+                        else:
+                            cell_elements_map.append((p, 'single', text, None))
+                            items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
-    # Пакетный перевод всех собранных элементов разом
+    # Пакетный перевод всех элементов разом
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
     )
@@ -689,12 +696,23 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         if trans:
             set_paragraph_text_safe(p, trans)
 
-    # Применение перевода к абзацам внутри таблиц
-    for idx, p in enumerate(cells_paragraphs_map):
-        res_idx = para_count + idx
-        trans = translated_results[res_idx]
-        if trans:
-            set_paragraph_text_safe(p, trans)
+    # Применение перевода к ячейкам с учетом их внутренней структуры (таблицы в таблице / пары ключ-значение)
+    current_res_idx = para_count
+    for item in cell_elements_map:
+        p, mode, left_val, right_val = item
+        if mode == 'single':
+            trans = translated_results[current_res_idx]
+            current_res_idx += 1
+            if trans:
+                set_paragraph_text_safe(p, trans)
+        elif mode == 'split':
+            trans_left = translated_results[current_res_idx]
+            trans_right = translated_results[current_res_idx + 1]
+            current_res_idx += 2
+            
+            new_left = trans_left if trans_left else left_val
+            new_right = trans_right if trans_right else right_val
+            set_paragraph_text_safe(p, f"{new_left} | {new_right}")
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -1084,8 +1102,8 @@ async def on_startup(bot: Bot):
 
 def main():
     if not BOT_TOKEN:
-        print("❌ ОШИБКА: Переменная окружения BOT_TOKEN не задана!")
-        return
+    print("❌ ОШИБКА: Переменная окружения BOT_TOKEN не задана!")
+    return
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
