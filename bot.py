@@ -1,6 +1,6 @@
 """
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
-(Excel, Word, PowerPoint, Text, Markdown, PDF) с надежным пакетным переводом через gtx API, 
+(Excel, Word, PowerPoint, Text, Markdown, PDF, Images) с надежным пакетным переводом через gtx API, 
 автоматической ротацией ключей (API_KEY1, API_KEY2...), сохранением глоссария, 
 конвертации единиц, полным OCR-распознаванием текстов на изображениях без их удаления, 
 интеграцией оплаты через Telegram Stars (10 звезд) и поддержкой Webhook для Render.
@@ -662,20 +662,16 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     t_elements = []
     
     # Абсолютный низкоуровневый обход КАЖДОГО тега <w:t> во всем документе XML.
-    # Это гарантирует 100% покрытие всего текста: обычных абзацев, колонтитулов 
-    # и любых сложных таблиц (включая вложенные и конвертированные из PDF).
     for t_elem in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
         text = t_elem.text
         if text and text.strip():
             t_elements.append(t_elem)
             items_to_translate.append({'text': text.strip(), 'index': len(items_to_translate)})
 
-    # Пакетный перевод всех собранных фрагментов
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
     )
 
-    # Замена текста напрямую в XML-элементах с сохранением исходной верстки и стилей
     for idx, t_elem in enumerate(t_elements):
         trans = translated_results[idx]
         if trans:
@@ -760,10 +756,6 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 
 
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
-    """
-    Конвертация PDF в Word через pdf2docx, а затем отправка полученного docx 
-    на глубокий покомпонентный перевод таблиц и текста.
-    """
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
     output_path = os.path.join(dir_path, f"{name}_RU.docx")
@@ -786,8 +778,6 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             cv = Converter(input_file)
             cv.convert(output_path, start=0, end=None)
             cv.close()
-            
-            # Передаем полученный docx в детальный обработчик таблиц
             return process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
@@ -816,6 +806,68 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     return output_path
 
 
+def process_image_file_with_ocr(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    """Распознавание текста с картинки (OCR) и его пакетный перевод"""
+    if pytesseract is None or Image is None:
+        raise ImportError("Библиотеки pytesseract или Pillow не установлены!")
+
+    try:
+        progress_text = (
+            f"🔍 Распознавание текста с изображения (OCR)...\n"
+            f"[░░░░░░░░░░] 0%\n"
+            f"Анализ графических элементов..."
+        )
+        asyncio.run_coroutine_threadsafe(
+            bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
+            main_loop
+        )
+    except Exception:
+        pass
+
+    lang = "eng+rus"
+    if "az" in direction:
+        lang = "aze+rus+eng"
+    elif "zh" in direction:
+        lang = "chi_sim+eng+rus"
+
+    try:
+        img = Image.open(input_file)
+        extracted_text = pytesseract.image_to_string(img, lang=lang)
+    except Exception as e:
+        raise RuntimeError(f"Ошибка OCR-распознавания изображения: {e}")
+
+    if not extracted_text.strip():
+        raise ValueError("На изображении не удалось обнаружить читаемый текст.")
+
+    lines = extracted_text.splitlines()
+    items_to_translate = []
+    for idx, line in enumerate(lines):
+        if line.strip():
+            items_to_translate.append({'text': line.strip(), 'index': idx})
+
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="текста с картинки"
+    )
+
+    translated_lines = []
+    for idx, line in enumerate(lines):
+        trans = translated_results[idx]
+        if trans and trans.strip():
+            translated_lines.append(trans + "\n")
+        else:
+            translated_lines.append(line + "\n")
+
+    dir_path, full_name = os.path.split(input_file)
+    name, ext = os.path.splitext(full_name)
+    suffix = get_file_suffix(direction)
+    output_path = os.path.join(dir_path, f"{name}{suffix}_OCR.txt")
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.writelines(translated_lines)
+        
+    return output_path
+
+
 def process_single_file_with_progress(file_path, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     ext = os.path.splitext(file_path)[1].lower()
     if ext in ['.docx']:
@@ -826,6 +878,8 @@ def process_single_file_with_progress(file_path, direction, bot: Bot, chat_id: i
         return process_text_document_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
     elif ext == '.pdf':
         return process_pdf_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
+    elif ext in ['.png', '.jpg', '.jpeg']:
+        return process_image_file_with_ocr(file_path, direction, bot, chat_id, message_id, main_loop)
     else:
         raise ValueError(f"Неподдерживаемый формат файла: {ext}")
 
@@ -843,7 +897,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "👋 Привет! Я ISA Drilling_translator_bot — универсальный переводчик документов "
         "для нефтегазовой и инженерной сферы.\n\n"
         "Поддерживаю форматы: Excel (.xlsx, .xls), Word (.docx), PowerPoint (.pptx), "
-        "Text/Markdown (.txt, .md, .csv), PDF (.pdf).\n\n"
+        "Text/Markdown (.txt, .md, .csv), PDF (.pdf), Картинки (.png, .jpg, .jpeg с OCR).\n\n"
         "Выберите направление перевода:"
     )
     
@@ -898,7 +952,7 @@ async def process_direction_callback(callback: CallbackQuery, state: FSMContext)
         
     await callback.message.edit_text(
         f"✅ Направление выбрано: {dir_name}.\n\n"
-        "Теперь отправьте мне пожалуйста файл для перевода. Я буду показывать прогресс выполнения!"
+        "Теперь отправьте мне пожалуйста файл или изображение для перевода. Я буду показывать прогресс выполнения!"
     )
     await state.set_state(TranslateStates.waiting_for_file)
     await callback.answer()
@@ -914,7 +968,7 @@ async def process_file_document(message: Message, state: FSMContext, bot: Bot):
     file_name = document.file_name
     ext = os.path.splitext(file_name)[1].lower()
 
-    supported_exts = ['.xlsx', '.xls', '.docx', '.pptx', '.txt', '.md', '.csv', '.pdf']
+    supported_exts = ['.xlsx', '.xls', '.docx', '.pptx', '.txt', '.md', '.csv', '.pdf', '.png', '.jpg', '.jpeg']
     if ext not in supported_exts:
         await message.answer(f"❌ Неподдерживаемый формат файла ({ext}). Поддерживаются: {', '.join(supported_exts)}")
         return
