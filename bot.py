@@ -660,14 +660,14 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
     doc = Document(input_file)
     items_to_translate = []
     
-    # 1. Сбор обычных абзацев вне таблиц
+    # 1. Сбор абзацев вне таблиц
     paragraphs_map = []
     for p in doc.paragraphs:
         if p.text.strip():
             paragraphs_map.append(p)
             items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
 
-    # 2. Интеллектуальный обход таблиц с поддержкой вложенных структур и разделителей ' | '
+    # 2. Продвинутый обход таблиц с поддержкой псевдотабличных разделителей ' | '
     cell_elements_map = []
     for table in doc.tables:
         for row in table.rows:
@@ -684,7 +684,7 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
                             cell_elements_map.append((p, 'single', text, None))
                             items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
-    # Пакетный перевод всех элементов разом
+    # Пакетный перевод всех собранных элементов разом
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
     )
@@ -696,7 +696,7 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
         if trans:
             set_paragraph_text_safe(p, trans)
 
-    # Применение перевода к ячейкам с учетом их внутренней структуры (таблицы в таблице / пары ключ-значение)
+    # Применение перевода к ячейкам с учетом их внутренней структуры
     current_res_idx = para_count
     for item in cell_elements_map:
         p, mode, left_val, right_val = item
@@ -827,12 +827,10 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             cv.convert(output_path, start=0, end=None)
             cv.close()
             
-            # Обрабатываем полученный документ через нашу глубокую функцию вордовских таблиц
             return process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
 
-    # Запасной вариант через pypdf
     out_doc = Document()
     reader = PdfReader(input_file)
     items_to_translate = []
@@ -1102,8 +1100,8 @@ async def on_startup(bot: Bot):
 
 def main():
     if not BOT_TOKEN:
-    print("❌ ОШИБКА: Переменная окружения BOT_TOKEN не задана!")
-    return
+        print("❌ ОШИБКА: Переменная окружения BOT_TOKEN не задана!")
+        return
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -1131,4 +1129,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+main()
