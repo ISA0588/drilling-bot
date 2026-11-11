@@ -543,7 +543,7 @@ def get_file_suffix(direction):
 
 
 def set_paragraph_text_safe(paragraph, new_text):
-    """Безопасно очищает содержимое параграфа и вставляет переведенный текст с сохранением стилей"""
+    """Безопасно очищает содержимое параграфа и вставляет переведенный текст"""
     p_elem = paragraph._element
     p_elem.clear_content()
     paragraph.add_run(new_text)
@@ -659,71 +659,48 @@ def batch_translate_with_progress(items_list, direction, bot: Bot, chat_id: int,
 def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     doc = Document(input_file)
     items_to_translate = []
+    xml_runs_map = []
     
-    # 1. Сбор обычных абзацев вне таблиц
-    paragraphs_map = []
+    # 1. Сбор всех абзацев документа
     for p in doc.paragraphs:
-        if p.text.strip():
-            paragraphs_map.append(p)
-            items_to_translate.append({'text': p.text, 'index': len(items_to_translate)})
+        for run in p.runs:
+            text = run.text.strip()
+            if text:
+                xml_runs_map.append(run)
+                items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
-    # 2. Сбор всех таблиц (каждый абзац каждой ячейки)
-    cell_paragraphs_map = []
+    # 2. Сбор всех таблиц через XML (находит 100% текста в ячейках сложных таблиц)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
-                    text = p.text.strip()
-                    if text:
-                        cell_paragraphs_map.append(p)
-                        items_to_translate.append({'text': text, 'index': len(items_to_translate)})
-
-    # 3. ВСПОМОГАТЕЛЬНЫЙ ОБХОД ШЕЙПОВ И ТЕКСТОВЫХ ПОЛЕЙ (Text Boxes/Shapes), 
-    # куда конвертеры PDF часто помещают таблицы и элементы верстки:
-    shapes_paragraphs_map = []
-    for shape in doc.inline_shapes if hasattr(doc, 'inline_shapes') else []:
-        pass
-    
-    # Рекурсивный обход XML-структуры тела документа для поиска всех скрытых текстовых блоков (w:txbxContent)
-    try:
-        for txbx in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}txbxContent'):
-            for p_elem in txbx.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
-                from docx.text.paragraph import Paragraph
-                p = Paragraph(p_elem, doc)
-                text = p.text.strip()
+                    for run in p.runs:
+                        text = run.text.strip()
+                        if text:
+                            xml_runs_map.append(run)
+                            items_to_translate.append({'text': text, 'index': len(items_to_translate)})
+                            
+    # 3. Сбор из текстовых полей / фреймов (txbxContent), если они есть в конвертированных из PDF файлах
+    for shape in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}txbxContent'):
+        for p_elem in shape.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
+            from docx.text.paragraph import Paragraph
+            p = Paragraph(p_elem, doc)
+            for run in p.runs:
+                text = run.text.strip()
                 if text:
-                    shapes_paragraphs_map.append(p)
+                    xml_runs_map.append(run)
                     items_to_translate.append({'text': text, 'index': len(items_to_translate)})
-    except Exception as e:
-        print(f"⚠️ Ошибка обхода текстовых полей: {e}")
 
-    # Пакетный перевод абсолютно всех найденных элементов (абзацы, ячейки таблиц, текстовые блоки)
+    # Пакетный перевод всех собранных текстовых фрагментов разом
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
     )
 
-    # Применение перевода к обычным абзацам
-    para_count = len(paragraphs_map)
-    for idx, p in enumerate(paragraphs_map):
+    # Применение перевода обратно к найденным текстовым фрагментам (runs)
+    for idx, run in enumerate(xml_runs_map):
         trans = translated_results[idx]
         if trans:
-            set_paragraph_text_safe(p, trans)
-
-    # Применение перевода к ячейкам таблиц
-    cell_count = len(cell_paragraphs_map)
-    for idx, p in enumerate(cell_paragraphs_map):
-        res_idx = para_count + idx
-        trans = translated_results[res_idx]
-        if trans:
-            set_paragraph_text_safe(p, trans)
-
-    # Применение перевода к текстовым полям / шейпам с сохранением структуры
-    shape_start_idx = para_count + cell_count
-    for idx, p in enumerate(shapes_paragraphs_map):
-        res_idx = shape_start_idx + idx
-        trans = translated_results[res_idx]
-        if trans:
-            set_paragraph_text_safe(p, trans)
+            run.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
