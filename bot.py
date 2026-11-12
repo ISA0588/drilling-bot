@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+import zipfile
 import asyncio
 from pathlib import Path
 
@@ -60,6 +61,7 @@ except ImportError:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 DEVELOPER_IDS = {8186927099, 1359780349, 9215066653}  # ID с бесплатным доступом
 STARS_PRICE = 10                          # Стоимость перевода в Telegram Stars
+MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024  # Безопасный лимит Telegram Bot API (~49 МБ)
 
 # Переменные для Webhook (Render автоматически подставляет RENDER_EXTERNAL_URL)
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
@@ -549,6 +551,66 @@ def set_paragraph_text_safe(paragraph, new_text):
     paragraph.add_run(new_text)
 
 
+# ==================== УТИЛИТА ОТПРАВКИ БОЛЬШИХ ФАЙЛОВ ====================
+async def send_translated_file_safe(message: Message, output_path: str, caption: str):
+    """
+    Проверяет размер готового файла. Если он превышает ~49 МБ (лимит Telegram Bot API 50 МБ),
+    пытается сжать его в ZIP-архив или разбивает архив на части < 49 МБ.
+    """
+    if not os.path.exists(output_path):
+        await message.answer("❌ Ошибка: переведенный файл не найден на сервере.")
+        return []
+
+    created_temp_files = []
+    file_size = os.path.getsize(output_path)
+
+    # 1. Если файл помещается в лимит Telegram (< 49 МБ) — отправляем напрямую
+    if file_size <= MAX_TELEGRAM_FILE_SIZE:
+        await message.answer_document(FSInputFile(output_path), caption=caption)
+        return created_temp_files
+
+    # 2. Если файл > 49 МБ, пробуем упаковать в ZIP с максимальным сжатием
+    zip_path = f"{output_path}.zip"
+    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.write(output_path, arcname=os.path.basename(output_path))
+    created_temp_files.append(zip_path)
+
+    zip_size = os.path.getsize(zip_path)
+    if zip_size <= MAX_TELEGRAM_FILE_SIZE:
+        await message.answer_document(
+            FSInputFile(zip_path),
+            caption=f"{caption}\n\n📦 Файл превышал 50 МБ, поэтому был автоматически упакован в ZIP-архив."
+        )
+        return created_temp_files
+
+    # 3. Если даже сжатый ZIP > 49 МБ — разбиваем на многотомные части (.part001, .part002...)
+    chunk_size = 45 * 1024 * 1024  # 45 МБ на каждый том
+    part_paths = []
+    with open(zip_path, 'rb') as f:
+        part_num = 1
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            part_path = f"{zip_path}.part{part_num:03d}"
+            with open(part_path, 'wb') as pf:
+                pf.write(chunk)
+            part_paths.append(part_path)
+            created_temp_files.append(part_path)
+            part_num += 1
+
+    await message.answer(
+        f"📦 Итоговый документ весит {file_size / (1024*1024):.1f} МБ (превышает лимит Telegram 50 МБ).\n"
+        f"Отправляю его в виде {len(part_paths)} частей архива. Чтобы открыть файл, скачайте все части в одну папку и распакуйте через 7-Zip / WinRAR."
+    )
+
+    for idx, p_path in enumerate(part_paths, 1):
+        part_caption = f"{caption} (Часть {idx} из {len(part_paths)})" if idx == 1 else f"Часть {idx} из {len(part_paths)}"
+        await message.answer_document(FSInputFile(p_path), caption=part_caption)
+
+    return created_temp_files
+
+
 # ==================== ОБРАБОТКА ФАЙЛОВ ====================
 def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
@@ -778,7 +840,10 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
             cv = Converter(input_file)
             cv.convert(output_path, start=0, end=None)
             cv.close()
-            return process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
+            res_path = process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
+            if os.path.exists(output_path) and output_path != res_path:
+                os.remove(output_path)
+            return res_path
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
 
@@ -1012,7 +1077,6 @@ async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery, bot: 
 async def successful_payment_handler(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     file_path = data.get("file_path")
-    file_name = data.get("file_name")
     direction = data.get("direction", "en_ru")
 
     if not file_path or not os.path.exists(file_path):
@@ -1020,6 +1084,8 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
         return
 
     status_msg = await message.answer("⏳ Оплата получена! Анализирую структуру файла...")
+    output_path = None
+    extra_temp_files = []
     
     try:
         main_loop = asyncio.get_running_loop()
@@ -1035,17 +1101,25 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
                 file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
 
-        document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="✅ Готово! Файл успешно переведен. Если снова понадобится помощь — обращайтесь! 😎")
+        extra_temp_files = await send_translated_file_safe(
+            message,
+            output_path,
+            caption="✅ Готово! Файл успешно переведен. Если снова понадобится помощь — обращайтесь! 😎"
+        )
         
-        try:
-            os.remove(file_path)
-            os.remove(output_path)
-            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
-        except:
-            pass
     except Exception as e:
         await message.answer(f"❌ Ошибка при обработке файла: {e}")
+    finally:
+        for p in [file_path, output_path] + extra_temp_files:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+        except Exception:
+            pass
     
     await state.clear()
 
@@ -1055,6 +1129,7 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
     
     local_path = None
     output_path = None
+    extra_temp_files = []
     try:
         file_info = await bot.get_file(document.file_id)
         downloaded_file = await bot.download_file(file_info.file_path)
@@ -1078,22 +1153,27 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
                 str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
         
-        document_to_send = FSInputFile(output_path)
-        await message.answer_document(document_to_send, caption="👑 Файл успешно переведен! Спасибо за ожидание 🤝.")
-        
-        try:
-            if local_path and os.path.exists(local_path):
-                os.remove(local_path)
-            if output_path and os.path.exists(output_path):
-                os.remove(output_path)
-            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
-        except:
-            pass
+        extra_temp_files = await send_translated_file_safe(
+            message,
+            output_path,
+            caption="👑 Файл успешно переведен! Спасибо за ожидание 🤝."
+        )
             
     except Exception as e:
         import traceback
         print("❌ ОШИБКА ПЕРЕВОДА:\n", traceback.format_exc())
         await message.answer(f"❌ Ошибка при переводе: {e}")
+    finally:
+        for p in [str(local_path) if local_path else None, output_path] + extra_temp_files:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+        except Exception:
+            pass
     
     await state.clear()
 
