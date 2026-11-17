@@ -720,24 +720,30 @@ def batch_translate_with_progress(items_list, direction, bot: Bot, chat_id: int,
 
 def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     doc = Document(input_file)
-    items_to_translate = []
-    t_elements = []
     
-    # Абсолютный низкоуровневый обход КАЖДОГО тега <w:t> во всем документе XML.
-    for t_elem in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
-        text = t_elem.text
-        if text and text.strip():
-            t_elements.append(t_elem)
-            items_to_translate.append({'text': text.strip(), 'index': len(items_to_translate)})
+    # Собираем все параграфы из основного текста и из таблиц для перевода целиком (без разрыва слов на теги/раны)
+    all_paragraphs = list(doc.paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                all_paragraphs.extend(cell.paragraphs)
+                
+    items_to_translate = []
+    valid_paragraphs = []
+    for p in all_paragraphs:
+        text = p.text.strip()
+        if text:
+            valid_paragraphs.append(p)
+            items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
     )
 
-    for idx, t_elem in enumerate(t_elements):
+    for idx, p in enumerate(valid_paragraphs):
         trans = translated_results[idx]
-        if trans:
-            t_elem.text = trans
+        if trans and trans != p.text:
+            set_paragraph_text_safe(p, trans)
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -750,31 +756,35 @@ def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: in
 def process_pptx_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     prs = Presentation(input_file)
     items_to_translate = []
-    shapes_refs = []
+    refs = []
 
     for slide in prs.slides:
         for shape in slide.shapes:
             if shape.has_text_frame:
                 for paragraph in shape.text_frame.paragraphs:
-                    for r in paragraph.runs:
-                        if r.text.strip():
-                            shapes_refs.append(('run', r))
-                            items_to_translate.append({'text': r.text, 'index': len(items_to_translate)})
+                    text = paragraph.text.strip()
+                    if text:
+                        refs.append(('paragraph', paragraph))
+                        items_to_translate.append({'text': text, 'index': len(items_to_translate)})
             elif shape.has_table:
                 for row in shape.table.rows:
                     for cell in row.cells:
-                        if cell.text.strip():
-                            shapes_refs.append(('cell', cell))
-                            items_to_translate.append({'text': cell.text, 'index': len(items_to_translate)})
+                        text = cell.text.strip()
+                        if text:
+                            refs.append(('cell', cell))
+                            items_to_translate.append({'text': text, 'index': len(items_to_translate)})
 
     translated_results = batch_translate_with_progress(
         items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="PowerPoint"
     )
 
-    for idx, (ref_type, ref_obj) in enumerate(shapes_refs):
+    for idx, (ref_type, ref_obj) in enumerate(refs):
         trans = translated_results[idx]
         if trans and trans != ref_obj.text:
-            ref_obj.text = trans
+            if ref_type == 'paragraph':
+                ref_obj.text = trans
+            elif ref_type == 'cell':
+                ref_obj.text = trans
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
