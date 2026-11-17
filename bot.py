@@ -1,10 +1,10 @@
 """
 Telegram-бот (isa_drilling_translator_bot) для двустороннего перевода документов 
-(Excel, Word, PowerPoint, Text, Markdown, PDF, Images) с надежным пакетным переводом через gtx API, 
-автоматической ротацией ключей (API_KEY1, API_KEY2...), сохранением глоссария, 
-конвертации единиц, полным OCR-распознаванием текстов на изображениях без их удаления, 
-интеграцией оплаты через Telegram Stars (10 звезд) и поддержкой Webhook для Render.
-+ Автоматическая очистка слитных слов и нефтяной технический редактор (Ollama + RegEx).
+(Excel, Word, PowerPoint, Text, Markdown, PDF, Images) с надежным пакетным переводом,
+контекстным ИИ-редактором на базе Gemini API (с ротацией ключей API_KEY1, API_KEY2...),
+сохранением глоссария (dictionary.xlsx), конвертацией единиц (имперские <-> метрические),
+полным OCR-распознаванием текстов на изображениях, оплатой через Telegram Stars (10 звезд)
+и поддержкой Webhook для Render.
 """
 
 import os
@@ -17,6 +17,7 @@ from pathlib import Path
 
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import io
 
@@ -28,16 +29,18 @@ from pypdf import PdfReader
 # Импорты для aiogram v3 и Webhook (aiohttp)
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
-    Message, 
-    PreCheckoutQuery, 
-    LabeledPrice, 
-    FSInputFile
+    Message,
+    PreCheckoutQuery,
+    LabeledPrice,
+    FSInputFile,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
@@ -61,8 +64,11 @@ except ImportError:
 # ==================== КОНФИГУРАЦИЯ БОТА ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 DEVELOPER_IDS = {8186927099, 1359780349, 9215066653}  # ID с бесплатным доступом
-STARS_PRICE = 10                          # Стоимость перевода в Telegram Stars
-MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024  # Безопасный лимит Telegram Bot API (~49 МБ)
+STARS_PRICE = 10                                      # Стоимость перевода в Telegram Stars
+MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024             # Безопасный лимит Telegram Bot API (~49 МБ)
+
+# Модель Gemini для контекстного технического перевода (если заданы API_KEY1, API_KEY2...)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 # Переменные для Webhook (Render автоматически подставляет RENDER_EXTERNAL_URL)
 WEBHOOK_HOST = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
@@ -99,7 +105,7 @@ class ApiKeyManager:
                 if not found_any_ahead:
                     break
                 i += 1
-        print(f"🔄 Загружено резервных API-ключей ротации: {len(self.keys)}")
+        print(f"🔄 Загружено API-ключей ротации: {len(self.keys)}")
 
     def get_current_key(self):
         if not self.keys:
@@ -119,6 +125,7 @@ api_manager = ApiKeyManager()
 CUSTOM_DICTIONARY = {}
 TRANSLATION_CACHE = {}
 
+
 class TranslateStates(StatesGroup):
     waiting_for_direction = State()
     waiting_for_file = State()
@@ -136,20 +143,17 @@ def load_custom_dictionary(direction="en_ru"):
                     col1 = str(row[0]).strip()
                     col2 = str(row[1]).strip()
                     if col1 and col2:
-                        if direction in ["en_ru", "en_zh_ru"]:
-                            custom_dict[col1.lower()] = col2
-                        elif direction == "ru_az":
+                        if direction in ["en_ru", "en_zh_ru", "ru_az", "ru_en"]:
                             custom_dict[col1.lower()] = col2
                         elif direction == "az_ru":
                             custom_dict[col2.lower()] = col1
-                        elif direction == "ru_en":
-                            custom_dict[col1.lower()] = col2
                         else:
                             custom_dict[col1.lower()] = col2
-            print(f"Загружен словарь ({direction}): {len(custom_dict)} записей.")
+            print(f"📚 Загружен словарь ({direction}): {len(custom_dict)} записей.")
         except Exception as e:
-            print(f"Ошибка чтения dictionary.xlsx: {e}")
+            print(f"⚠️ Ошибка чтения dictionary.xlsx: {e}")
     return custom_dict
+
 
 CUSTOM_DICTIONARY = load_custom_dictionary("en_ru")
 
@@ -160,7 +164,7 @@ def log_untranslated_term(term):
         existing = set()
         if log_path.exists():
             existing = set(log_path.read_text(encoding="utf-8").splitlines())
-        
+
         if term not in existing:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(term + "\n")
@@ -170,64 +174,212 @@ def log_untranslated_term(term):
 
 def get_lang_codes(direction):
     """Возвращает корректные коды языков (src, tgt) для Google API"""
-    if direction == 'az_ru':
-        return 'az', 'ru'
-    elif direction == 'en_ru':
-        return 'en', 'ru'
-    elif direction == 'ru_en':
-        return 'ru', 'en'
-    elif direction == 'ru_az':
-        return 'ru', 'az'
-    elif direction == 'en_zh_ru':
-        return 'auto', 'ru'
-    else:
-        return 'auto', 'ru'
+    mapping = {
+        'az_ru': ('az', 'ru'),
+        'en_ru': ('en', 'ru'),
+        'ru_en': ('ru', 'en'),
+        'ru_az': ('ru', 'az'),
+        'en_zh_ru': ('auto', 'ru'),
+    }
+    return mapping.get(direction, ('auto', 'ru'))
 
 
-# ==================== УМНАЯ ПОСТ-ОБРАБОТКА И РЕДАКТУРА ====================
-def fix_fused_words(text):
-    """Автоматически разделяет слитные слова и артефакты таблиц (например: буренияиз -> бурения из)"""
+def get_direction_description(direction):
+    """Описание направления перевода для ИИ-переводчика"""
+    descriptions = {
+        'az_ru': "Azerbaijani to Russian",
+        'en_ru': "English to Russian",
+        'ru_en': "Russian to English",
+        'ru_az': "Russian to Azerbaijani",
+        'en_zh_ru': "mixed English and Chinese to Russian",
+    }
+    return descriptions.get(direction, "foreign language to Russian")
+
+
+# ==================== УМНАЯ ПОСТ-ОБРАБОТКА И НОРМАЛИЗАЦИЯ ТЕКСТА ====================
+def normalize_source_text(text):
+    """
+    Очищает исходный текст перед переводом:
+    - восстанавливает пробелы после знаков препинания и скобок, потерянные при парсинге PDF/Word;
+    - убирает мусорные артефакты кодировки.
+    """
     if not isinstance(text, str):
         return text
-    
-    preps = r'(из|на|v|в|по|с|до|от|для|при|около|под|над|за)'
-    pattern = rf'([а-яёА-ЯЁ]{2,})({preps})([а-яёА-ЯЁ]{2,})'
-    text = re.sub(pattern, r'\1 \2 \3', text, flags=re.IGNORECASE)
-    return text
+
+    text = re.sub(r'([,;:])([A-Za-zА-Яа-яЁёƏəĞğİıÖöŞşÜüÇç])', r'\1 \2', text)
+    text = re.sub(r'([A-Za-zА-Яа-яЁёƏəĞğİıÖöŞşÜüÇç])\(', r'\1 (', text)
+    text = re.sub(r'\)([A-Za-zА-Яа-яЁёƏəĞğİıÖöŞşÜüÇç])', r') \1', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text.strip()
 
 
-def ollama_oilfield_editor(text, direction="en_ru"):
-    """Использует локальную LLM как профессионального технического редактора нефтяной сферы"""
-    if not requests or not text or len(text.strip()) < 5:
+def fix_fused_words_and_artifacts(text, direction="en_ru"):
+    """
+    Универсальная пост-обработка переведенного текста:
+    1. Разделяет слипшиеся слова на стыке регистра, скобок, цифр и предлогов.
+    2. Устраняет типовые ошибки машинного перевода нефтегазовой и ПЛА-терминологии (AZ/EN -> RU).
+    """
+    if not isinstance(text, str):
         return text
-        
-    try:
-        url = "http://localhost:11434/api/generate"
-        prompt = (
-            "You are a professional petroleum engineer and technical translator. "
-            "Review the following translated text. Fix any machine translation artifacts, "
-            "literal translations of oilfield terms (e.g., 'мастер дрели' -> 'буровой мастер', "
-            "'топдрайвер' -> 'верхний привод', 'манга' -> 'расчет'), and fused/broken words. "
-            "Keep technical accuracy absolute (BOP, kill line, choke line, mud weight, etc.). "
-            "Return ONLY the corrected, clean Russian technical text without explanations:\n\n"
-            f"{text}"
-        )
-        
+
+    # 1. Разделение склеек на границе строчной и заглавной буквы: "словоСлово" -> "слово Слово"
+    text = re.sub(r'([а-яёa-zəğıöşüç])([А-ЯЁA-ZƏĞIİÖŞÜÇ])', r'\1 \2', text)
+
+    # 2. Разделение склеек букв и цифр: "10мин" -> "10 мин"
+    text = re.sub(r'(\d)([А-Яа-яЁё]{2,})', r'\1 \2', text)
+
+    # 3. Пробелы вокруг скобок и после знаков препинания
+    text = re.sub(r'([а-яёА-ЯЁ])\(', r'\1 (', text)
+    text = re.sub(r'\)([а-яёА-ЯЁ])', r') \1', text)
+    text = re.sub(r'([,;:])([а-яёА-ЯЁ])', r'\1 \2', text)
+
+    # 4. Разделение слипшихся предлогов внутри длинных склеек
+    fused_preps = r'(из|при|для|около|после|перед|через|между|под|над)'
+    text = re.sub(rf'([а-яёА-ЯЁ]{{4,}})({fused_preps})([а-яёА-ЯЁ]{{3,}})', r'\1 \2 \3', text)
+
+    # 5. Расширенный словарь исправления машинных ляпов для нефтегазовой и морской тематики (RU)
+    if direction in ["en_ru", "en_zh_ru", "az_ru"]:
+        replacements = [
+            (r'\bморская эссенция\b', 'морское основание (МСП)'),
+            (r'\bморской эссенции\b', 'морского основания (МСП)'),
+            (r'\bЛАРИНОТМЕНАПЛАН\b', 'ПЛАН ЛИКВИДАЦИИ АВАРИЙ (ПЛА)'),
+            (r'\bНетстационарный\b', '№ стационарное'),
+            (r'\bНетВОЗ\b', '№ МСП'),
+            (r'\bВ ВОЗ нет\b', 'На МСП №'),
+            (r'\bВОЗ-2585\b', 'МСП-2585'),
+            (r'\bДС-2585\b', 'МСП-2585'),
+            (r'\bв ОЗЮЛЕ\b', 'на МСП (морском стационарном основании)'),
+            (r'\bс ОЗЮЛ\b', 'с МСП'),
+            (r'\bмежду ОЗЮЛ\b', 'между МСП'),
+            (r'\bУправление Озул\b', 'Руководство МСП'),
+            (r'\bМанга «Пожарные»\b', 'Пожарный расчет'),
+            (r'\bманги о пожаротушении\b', 'пожарного расчета'),
+            (r'\bМанга\b', 'Расчет'),
+            (r'\bБудь собой\b', 'МСП'),
+            (r'\bбудь собой\b', 'МСП'),
+            (r'\bСам по себе\b', 'На МСП'),
+            (r'\bСамоуправление\b', 'Руководство МСП'),
+            (r'\bПерсональное управление\b', 'Руководство МСП'),
+            (r'\bГлава самого себя\b', 'Начальник МСП'),
+            (r'\bМастер дрели\b', 'Буровой мастер'),
+            (r'\bмастер дрели\b', 'буровой мастер'),
+            (r'\bТопДрайвер\b', 'Верхний привод (СВП)'),
+            (r'\bбурильным топором\b', 'долотом'),
+            (r'\bбурильного топора\b', 'долота'),
+            (r'\bбуровым топором\b', 'долотом'),
+            (r'\bгидравлический ящик\b', 'гидравлическая задвижка'),
+            (r'\bразгрузочный ящик\b', 'дроссельная задвижка'),
+            (r'\bопорной трубе\b', 'обсадной колонне'),
+            (r'\bзащитных поясов\b', 'обсадных колонн'),
+            (r'\bпромежуточный предохранитель\b', 'промежуточная обсадная колонна'),
+            (r'\bтолстой кишки\b', 'колонны'),
+            (r'\bтолстая кишка\b', 'колонна'),
+            (r'\bсухуровлавина\b', 'обвал стенок скважины'),
+            (r'\bСудороги при сверлении\b', 'Прихват при бурении'),
+            (r'\bпрыжок, фонтан\b', 'ГНВП, открытый фонтан'),
+            (r'\bпрыжок, шрифтмомент\b', 'ГНВП, открытый фонтан'),
+            (r'\btullanış, fontan\b', 'ГНВП, открытый фонтан'),
+            (r'\bбаках с раствором\b', 'емкостях бурового раствора'),
+            (r'\bв гримерке\b', 'в раздевалке'),
+            (r'\bЭнергичный\b', 'Энергетик'),
+            (r'\bQXQ-монахиня\b', 'АСФ (аварийно-спасательного формирования)'),
+            (r'\bQQQ-монахиня\b', 'АСФ'),
+            (r'\bQXQ\b', 'АСФ'),
+            (r'\bQQQ\b', 'АСФ'),
+            (r'\bпожаротушение\b', 'пожарному'),
+            (r'\bоказание необходимой помощи лошади\b', 'оказание необходимой помощи'),
+            (r'\bбыть застреленным\b', 'подачу воды'),
+            (r'\bне принимайте близко к сердцу\b', 'не допускать приближения'),
+            (r'\bОбщийвозбуждение\b', 'Общая тревога'),
+            (r'\bОбщий принципвозбуждение\b', 'Общая тревога'),
+            (r'\bБжелезоперсонал\b', 'Весь персонал'),
+            (r'\bбжелезоперсонал\b', 'Весь персонал'),
+            (r'\bМинистерство иностранных дел Государственного агентства SITGDMN\b', 'Государственное агентство по безопасному ведению работ в промышленности и горному надзору (SİTGDMN) МЧС'),
+        ]
+        for pattern, repl in replacements:
+            text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text.strip()
+
+
+# ==================== КОНТЕКСТНЫЙ ПЕРЕВОД И РЕДАКТУРА ЧЕРЕЗ GEMINI API ====================
+def translate_batch_via_gemini(texts_list, direction="en_ru"):
+    """
+    Переводит список строк пакетом через Gemini API (используя ротацию ключей API_KEY1, API_KEY2...).
+    Возвращает список переведенных строк той же длины или None при недоступности API.
+    """
+    if not texts_list or not api_manager.keys:
+        return None
+
+    lang_desc = get_direction_description(direction)
+    numbered_input = "\n".join([f"[{idx}] {txt}" for idx, txt in enumerate(texts_list)])
+
+    system_prompt = (
+        f"You are an expert petroleum & offshore drilling engineer and technical translator ({lang_desc}). "
+        "Translate each numbered line below accurately into professional technical terminology used in oil & gas drilling, "
+        "well control, offshore platforms (МСП / Özül), and Emergency Response Plans (ПЛА / Qəzaların Ləğvi Planı).\n"
+        "CRITICAL RULES:\n"
+        "1. Fix broken spacing, fused words, or OCR typos from the source text so the output has clean, natural spacing.\n"
+        "2. Translate domain terms accurately (e.g., Özül -> МСП / морское стационарное основание, Qəza -> авария, "
+        "Tullanış/fontan -> ГНВП / открытый фонтан, Qazma ustası -> буровой мастер, Manqa -> расчет/звено, "
+        "Top Drive -> верхний привод, Qoruyucu kəmər -> обсадная колонна, Tutulma -> прихват, Uçqun -> обвал стенок скважины, "
+        "Udma -> поглощение бурового раствора, Preventor -> превентор).\n"
+        "3. Preserve all numbers, codes, abbreviations, and line indices [0], [1], ... exactly.\n"
+        '4. Return ONLY a valid JSON object mapping string index to translated string, e.g. {"0": "...", "1": "..."}.'
+    )
+
+    attempts = max(1, len(api_manager.keys))
+    for _ in range(attempts):
+        current_key = api_manager.get_current_key()
+        if not current_key:
+            break
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={current_key}"
         payload = {
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False
+            "contents": [
+                {
+                    "parts": [
+                        {"text": f"{system_prompt}\n\nINPUT LINES:\n{numbered_input}"}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json"
+            }
         }
-        response = requests.post(url, json=payload, timeout=8)
-        if response.status_code == 200:
-            res_json = response.json()
-            edited = res_json.get("response", "").strip()
-            if edited:
-                return edited
-    except Exception:
-        pass
-        
-    return text
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                candidates = resp_data.get("candidates", [])
+                if candidates:
+                    raw_text = candidates[0]["content"]["parts"][0]["text"].strip()
+                    parsed_map = json.loads(raw_text)
+                    translated_list = []
+                    for idx, orig in enumerate(texts_list):
+                        val = parsed_map.get(str(idx), orig)
+                        translated_list.append(str(val).strip() if val else orig)
+                    return translated_list
+        except urllib.error.HTTPError as e:
+            print(f"⚠️ Ошибка Gemini API (HTTP {e.code}), выполняю ротацию ключа...")
+            if e.code in [429, 403, 500, 503]:
+                api_manager.rotate()
+                time.sleep(0.4)
+            else:
+                break
+        except Exception as e:
+            print(f"⚠️ Сбой запроса к Gemini API: {e}")
+            api_manager.rotate()
+            time.sleep(0.3)
+
+    return None
 
 
 def translate_via_ollama(text, direction="en_ru"):
@@ -235,17 +387,14 @@ def translate_via_ollama(text, direction="en_ru"):
         return None
     try:
         url = "http://localhost:11434/api/generate"
-        if direction == "en_zh_ru":
-            prompt = f"Translate the following mixed English and Chinese technical text into accurate Russian. Keep technical terms precise. Return only clean Russian translation without original text:\n\n{text}"
-        elif direction == "en_ru":
-            prompt = f"Translate the following technical text from English to Russian accurately. Keep technical terms precise. Return only translation:\n\n{text}"
-        elif direction == "ru_az":
-            prompt = f"Translate the following technical text from Russian to Azerbaijani accurately. Keep technical terms precise. Return only translation:\n\n{text}"
-        elif direction == "az_ru":
-            prompt = f"Translate the following technical text from Azerbaijani to Russian accurately. Keep technical terms precise. Return only translation:\n\n{text}"
-        else:
-            prompt = f"Translate the following technical text from Russian to English accurately. Keep technical terms precise. Return only translation:\n\n{text}"
-        
+        lang_desc = get_direction_description(direction)
+        prompt = (
+            f"You are a professional petroleum engineer and technical translator ({lang_desc}). "
+            "Translate the following technical text accurately into clean, natural terminology. "
+            "Fix any fused words or OCR typos. Return ONLY the clean translation without explanations:\n\n"
+            f"{text}"
+        )
+
         payload = {
             "model": "llama3",
             "prompt": prompt,
@@ -262,6 +411,7 @@ def translate_via_ollama(text, direction="en_ru"):
     return None
 
 
+# ==================== КОНВЕРТАЦИЯ ЕДИНИЦ ИЗМЕРЕНИЯ ====================
 def parse_inch_value(s):
     """Распознает десятичные, дробные и слитные (171/2) значения дюймов"""
     s = s.strip().replace(',', '.')
@@ -291,8 +441,13 @@ def convert_imperial_to_metric_advanced(text):
     if not isinstance(text, str):
         return text
     res = text
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:ft-?lbs?|foot-?pounds?|фут-?фунт[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*1.35582:.1f} Н·м)", res, flags=re.IGNORECASE)
-    
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:ft-?lbs?|foot-?pounds?|фут-?фунт[а-я]*)',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 1.35582:.1f} Н·м)",
+        res,
+        flags=re.IGNORECASE
+    )
+
     def replace_large_lbs(m):
         val_str = m.group(2).replace(',', '')
         try:
@@ -301,11 +456,11 @@ def convert_imperial_to_metric_advanced(text):
                 return f"{m.group(0)} (~{val * 0.00045359237:.1f} т)"
             else:
                 return f"{m.group(0)} (~{val * 0.45359237:.1f} кг)"
-        except:
+        except Exception:
             return m.group(0)
 
-    res = re.sub(r'([+\-±]+)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(?:lbs|pounds|lb)', replace_large_lbs, res, flags=re.IGNORECASE)
-    
+    res = re.sub(r'([+\-±]+)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(?:lbs|pounds|lb)\b', replace_large_lbs, res, flags=re.IGNORECASE)
+
     def replace_gpm(m):
         full_match = m.group(0)
         val_str = m.group(2).replace(',', '')
@@ -314,12 +469,17 @@ def convert_imperial_to_metric_advanced(text):
             m3_h = val * 0.227124
             l_min = val * 3.78541
             return f"{full_match} (~{m3_h:.1f} м³/ч / {l_min:.0f} л/мин)"
-        except:
+        except Exception:
             return full_match
 
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:gpm|gal/min|gallons\s+per\s+minute)', replace_gpm, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:KVA|kVA|kva)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.8:.0f} кВт)", res, flags=re.IGNORECASE)
-    
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:gpm|gal/min|gallons\s+per\s+minute)\b', replace_gpm, res, flags=re.IGNORECASE)
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:KVA|kVA|kva)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 0.8:.0f} кВт)",
+        res,
+        flags=re.IGNORECASE
+    )
+
     def replace_hp_range(m):
         full_match = m.group(0)
         val_part = m.group(2)
@@ -328,39 +488,79 @@ def convert_imperial_to_metric_advanced(text):
             try:
                 v1 = float(parts[0].strip())
                 v2 = float(parts[1].strip())
-                return f"{full_match} (~{v1*0.7457:.0f}/{v2*0.7457:.0f} кВт)"
-            except:
+                return f"{full_match} (~{v1 * 0.7457:.0f}/{v2 * 0.7457:.0f} кВт)"
+            except Exception:
                 pass
         elif '-' in val_part:
             parts = val_part.split('-')
             try:
                 v1 = float(parts[0].strip())
                 v2 = float(parts[1].strip())
-                return f"{full_match} (~{v1*0.7457:.0f}-{v2*0.7457:.0f} кВт)"
-            except:
+                return f"{full_match} (~{v1 * 0.7457:.0f}-{v2 * 0.7457:.0f} кВт)"
+            except Exception:
                 pass
         try:
             val = float(val_part.replace(',', ''))
-            return f"{full_match} (~{val*0.7457:.0f} кВт)"
-        except:
+            return f"{full_match} (~{val * 0.7457:.0f} кВт)"
+        except Exception:
             return full_match
 
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*(?:\s*[\/\-]\s*\d+[\d,]*\.?\d*)?)\s*(?:HP|hp)', replace_hp_range, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:Klbs|k-lbs|klbs|kips)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.45359237:.1f} т)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:tons|tonnes)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.907185:.1f} т)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*psi', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.00689476:.1f} МПа)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:ft|фут[а-я]*|feet|foot)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.3048:.1f} м)", res, flags=re.IGNORECASE)
-    
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*(?:\s*[\/\-]\s*\d+[\d,]*\.?\d*)?)\s*(?:HP|hp)\b', replace_hp_range, res, flags=re.IGNORECASE)
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:Klbs|k-lbs|klbs|kips)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 0.45359237:.1f} т)",
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:tons|tonnes)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 0.907185:.1f} т)",
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*psi\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 0.00689476:.1f} МПа)",
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:ft|фут[а-я]*|feet|foot)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 0.3048:.1f} м)",
+        res,
+        flags=re.IGNORECASE
+    )
+
     def replace_inch(m):
         parsed = parse_inch_value(m.group(2))
         if parsed is not None:
             return f"{m.group(0)} (~{parsed * 25.4:.1f} мм)"
         return m.group(0)
-        
-    res = re.sub(r'([+\-±]+)?\s*(\d+(?:[\s\-.]\d+\/\d+|[.,]\d+|\/\d+)?)\s*(?:in|inch|["″]|дюйм[а-я]*)', replace_inch, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:bbls|bbl|barrels|баррел[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.158987:.1f} м³)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:kl|kL|kiloliters|килолитр[а-я]*)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',','')):.1f} м³)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:gal|gallons)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*3.78541:.1f} л)", res, flags=re.IGNORECASE)
+
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+(?:[\s\-.]\d+\/\d+|[.,]\d+|\/\d+)?)\s*(?:in\b|inch\b|["″]|дюйм[а-я]*)',
+        replace_inch,
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:bbls|bbl|barrels|баррел[а-я]*)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 0.158987:.1f} м³)",
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:kl|kL|kiloliters|килолитр[а-я]*)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')):.1f} м³)",
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:gal|gallons)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 3.78541:.1f} л)",
+        res,
+        flags=re.IGNORECASE
+    )
     return res
 
 
@@ -368,8 +568,13 @@ def convert_metric_to_imperial_advanced(text):
     if not isinstance(text, str):
         return text
     res = text
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:Н[·\.]м|Nm|N\s*m)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))*0.737562:.1f} ft-lb)", res, flags=re.IGNORECASE)
-    
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:Н[·\.]м|Nm|N\s*m)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) * 0.737562:.1f} ft-lb)",
+        res,
+        flags=re.IGNORECASE
+    )
+
     def replace_metric_tons(m):
         full_match = m.group(0)
         try:
@@ -380,13 +585,28 @@ def convert_metric_to_imperial_advanced(text):
                 return f"{full_match} (~{klbs_val:.1f} Klbs / {lbs_val:,.0f} lbs)"
             else:
                 return f"{full_match} (~{lbs_val:.0f} lbs)"
-        except:
+        except Exception:
             return full_match
 
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:т|тонн[а-я]*)', replace_metric_tons, res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:МПа|MPa)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/0.00689476:.0f} psi)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:м\b|метров|metres|meters|meter)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/0.3048:.1f} ft)", res, flags=re.IGNORECASE)
-    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:мм\b|mm)', lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',',''))/25.4:.2f} in)", res, flags=re.IGNORECASE)
+    res = re.sub(r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:т\b|тонн[а-я]*)', replace_metric_tons, res, flags=re.IGNORECASE)
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:МПа|MPa)\b',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) / 0.00689476:.0f} psi)",
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:м\b|метров|metres|meters|meter)',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) / 0.3048:.1f} ft)",
+        res,
+        flags=re.IGNORECASE
+    )
+    res = re.sub(
+        r'([+\-±]+)?\s*(\d+[\d,]*\.?\d*)\s*(?:мм\b|mm\b)',
+        lambda m: f"{m.group(0)} (~{float(m.group(2).replace(',', '')) / 25.4:.2f} in)",
+        res,
+        flags=re.IGNORECASE
+    )
     return res
 
 
@@ -402,7 +622,7 @@ def ocr_image_bytes(img_bytes, direction="en_ru"):
             lang = "aze+rus+eng"
         elif "zh" in direction:
             lang = "chi_sim+eng+rus"
-            
+
         text = pytesseract.image_to_string(img, lang=lang)
         return text.strip()
     except Exception as e:
@@ -412,13 +632,13 @@ def ocr_image_bytes(img_bytes, direction="en_ru"):
 
 # ==================== ОТКАЗОУСТОЙЧИВЫЙ СЕТЕВОЙ ПЕРЕВОДЧИК ====================
 def safe_translate_request(clean_text, src_lang, tgt_lang):
-    """Надежный прямой запрос к переводчику Google с поддержкой всех языков"""
+    """Резервный прямой запрос к переводчику Google GTX / Translate v2"""
     if not clean_text or not clean_text.strip():
         return clean_text
 
     encoded_text = urllib.parse.quote(clean_text)
-    
-    # 1. Прямой стабильный запрос через Google Translate GTX
+
+    # 1. Прямой запрос через Google Translate GTX
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={src_lang}&tl={tgt_lang}&dt=t&q={encoded_text}"
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
@@ -430,9 +650,9 @@ def safe_translate_request(clean_text, src_lang, tgt_lang):
     except Exception as e:
         print(f"⚠️ Сетевая ошибка GTX перевода: {e}")
 
-    # 2. Резервный вызов API v2 с ротацией ключей
+    # 2. Резервный вызов Google Cloud Translate v2 с ротацией ключей
     attempts = max(1, len(api_manager.keys) + 1)
-    for attempt in range(attempts):
+    for _ in range(attempts):
         try:
             current_key = api_manager.get_current_key()
             if current_key:
@@ -452,21 +672,21 @@ def safe_translate_request(clean_text, src_lang, tgt_lang):
         except Exception:
             api_manager.rotate()
             time.sleep(0.3)
-            
+
     return clean_text
 
 
 def process_text_smart(text, direction="en_ru"):
     if not isinstance(text, str):
         return text
-    
-    clean_text = text.strip()
+
+    clean_text = normalize_source_text(text)
     if not clean_text:
         return text
 
     if clean_text.replace('.', '', 1).isdigit() or clean_text.upper() in ["NA", "N/A", "-", "YES", "NO", "TBD", "TRUE", "FALSE"]:
         res_val = convert_imperial_to_metric_advanced(clean_text) if direction in ["en_ru", "en_zh_ru", "az_ru"] else convert_metric_to_imperial_advanced(clean_text)
-        return fix_fused_words(res_val)
+        return fix_fused_words_and_artifacts(res_val, direction)
 
     lower_clean = clean_text.lower()
     normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
@@ -484,41 +704,41 @@ def process_text_smart(text, direction="en_ru"):
             if clean_text.isupper() and len(clean_text) > 1:
                 translated = translated.upper()
             res_val = apply_units(translated)
-            return fix_fused_words(res_val)
+            return fix_fused_words_and_artifacts(res_val, direction)
 
     cache_key = f"{direction}_{normalized_key}"
     if cache_key in TRANSLATION_CACHE:
         translated = TRANSLATION_CACHE[cache_key]
         res_val = apply_units(translated)
-        return fix_fused_words(res_val)
+        return fix_fused_words_and_artifacts(res_val, direction)
 
-    src_lang, tgt_lang = get_lang_codes(direction)
-    result = safe_translate_request(clean_text, src_lang, tgt_lang)
-
-    if not result or result == clean_text:
-        result = translate_via_ollama(clean_text, direction)
+    # Приоритет 1: Контекстный ИИ-перевод через Gemini API (если заданы ключи)
+    gemini_res = translate_batch_via_gemini([clean_text], direction)
+    if gemini_res and gemini_res[0] and gemini_res[0] != clean_text:
+        result = gemini_res[0]
+    else:
+        # Приоритет 2: Google GTX + пост-обработка
+        src_lang, tgt_lang = get_lang_codes(direction)
+        result = safe_translate_request(clean_text, src_lang, tgt_lang)
+        if not result or result == clean_text:
+            result = translate_via_ollama(clean_text, direction)
 
     if result and result.strip():
-        clean_result = result.strip()
+        clean_result = fix_fused_words_and_artifacts(result.strip(), direction)
         TRANSLATION_CACHE[cache_key] = clean_result
-        
-        # Автоматическая пост-обработка для новых/неизвестных терминов
-        clean_result = fix_fused_words(clean_result)
-        clean_result = ollama_oilfield_editor(clean_result, direction)
-        
         return apply_units(clean_result)
     else:
         log_untranslated_term(clean_text)
 
     res_val = apply_units(clean_text)
-    return fix_fused_words(res_val)
+    return fix_fused_words_and_artifacts(res_val, direction)
 
 
 # ==================== НАДЕЖНЫЙ ПАКЕТНЫЙ ПЕРЕВОД (БАТЧИНГ) ====================
 def batch_translate_texts(texts_list, direction="en_ru"):
     if not texts_list:
         return []
-    
+
     results = [None] * len(texts_list)
     uncached_indices = []
     uncached_texts = []
@@ -527,18 +747,18 @@ def batch_translate_texts(texts_list, direction="en_ru"):
         if not isinstance(text, str) or not text.strip():
             results[i] = text
             continue
-        
-        clean_text = text.strip()
+
+        clean_text = normalize_source_text(text)
         lower_clean = clean_text.lower()
         normalized_key = re.sub(r'[^\w\s]', '', lower_clean).strip()
-        
+
         found = False
         for k in [normalized_key, lower_clean]:
             if k in CUSTOM_DICTIONARY:
                 tr = CUSTOM_DICTIONARY[k]
                 if clean_text.isupper() and len(clean_text) > 1:
                     tr = tr.upper()
-                results[i] = tr
+                results[i] = fix_fused_words_and_artifacts(tr, direction)
                 found = True
                 break
         if found:
@@ -554,28 +774,43 @@ def batch_translate_texts(texts_list, direction="en_ru"):
 
     if uncached_texts:
         src_lang, tgt_lang = get_lang_codes(direction)
-        batch_size = 10
+        batch_size = 15
+
         for start_idx in range(0, len(uncached_texts), batch_size):
             chunk_texts = uncached_texts[start_idx:start_idx + batch_size]
             chunk_indices = uncached_indices[start_idx:start_idx + batch_size]
-            
-            for idx_in_chunk, single_text in enumerate(chunk_texts):
-                orig_idx = chunk_indices[idx_in_chunk]
-                translated_sentence = safe_translate_request(single_text, src_lang, tgt_lang)
-                
-                if translated_sentence and translated_sentence.strip():
-                    clean_res = translated_sentence.strip()
-                    # Применяем редактуру и очистку к батчу
-                    clean_res = fix_fused_words(clean_res)
-                    clean_res = ollama_oilfield_editor(clean_res, direction)
-                    
+
+            # 1. Пробуем контекстный пакетный перевод через Gemini API (с ротацией ключей)
+            gemini_chunk = translate_batch_via_gemini(chunk_texts, direction)
+
+            if gemini_chunk and len(gemini_chunk) == len(chunk_texts):
+                for idx_in_chunk, translated_sentence in enumerate(gemini_chunk):
+                    orig_idx = chunk_indices[idx_in_chunk]
+                    single_text = chunk_texts[idx_in_chunk]
+                    clean_res = fix_fused_words_and_artifacts(translated_sentence.strip(), direction)
                     results[orig_idx] = clean_res
                     norm_k = re.sub(r'[^\w\s]', '', single_text.lower()).strip()
                     TRANSLATION_CACHE[f"{direction}_{norm_k}"] = clean_res
-                else:
-                    results[orig_idx] = single_text
-                    
-            time.sleep(0.1)
+            else:
+                # 2. Fallback на построчный перевод GTX + пост-обработка
+                for idx_in_chunk, single_text in enumerate(chunk_texts):
+                    orig_idx = chunk_indices[idx_in_chunk]
+                    translated_sentence = safe_translate_request(single_text, src_lang, tgt_lang)
+
+                    if not translated_sentence or translated_sentence == single_text:
+                        ollama_tr = translate_via_ollama(single_text, direction)
+                        if ollama_tr:
+                            translated_sentence = ollama_tr
+
+                    if translated_sentence and translated_sentence.strip():
+                        clean_res = fix_fused_words_and_artifacts(translated_sentence.strip(), direction)
+                        results[orig_idx] = clean_res
+                        norm_k = re.sub(r'[^\w\s]', '', single_text.lower()).strip()
+                        TRANSLATION_CACHE[f"{direction}_{norm_k}"] = clean_res
+                    else:
+                        results[orig_idx] = fix_fused_words_and_artifacts(single_text, direction)
+
+            time.sleep(0.15)
 
     final_results = []
     for i, res in enumerate(results):
@@ -586,22 +821,19 @@ def batch_translate_texts(texts_list, direction="en_ru"):
             final_results.append(convert_metric_to_imperial_advanced(target_val))
         else:
             final_results.append(target_val)
-            
+
     return final_results
 
 
 def get_file_suffix(direction):
-    if direction == "en_zh_ru":
-        return "_EN_ZH_RU"
-    elif direction == "en_ru":
-        return "_RU"
-    elif direction == "ru_en":
-        return "_EN"
-    elif direction == "ru_az":
-        return "_AZ"
-    elif direction == "az_ru":
-        return "_RU"
-    return "_TR"
+    suffixes = {
+        "en_zh_ru": "_EN_ZH_RU",
+        "en_ru": "_RU",
+        "ru_en": "_EN",
+        "ru_az": "_AZ",
+        "az_ru": "_RU",
+    }
+    return suffixes.get(direction, "_TR")
 
 
 # ==================== УТИЛИТА ОТПРАВКИ БОЛЬШИХ ФАЙЛОВ ====================
@@ -617,12 +849,10 @@ async def send_translated_file_safe(message: Message, output_path: str, caption:
     created_temp_files = []
     file_size = os.path.getsize(output_path)
 
-    # 1. Если файл помещается в лимит Telegram (< 49 МБ) — отправляем напрямую
     if file_size <= MAX_TELEGRAM_FILE_SIZE:
         await message.answer_document(FSInputFile(output_path), caption=caption)
         return created_temp_files
 
-    # 2. Если файл > 49 МБ, пробуем упаковать в ZIP с максимальным сжатием
     zip_path = f"{output_path}.zip"
     with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         zf.write(output_path, arcname=os.path.basename(output_path))
@@ -636,8 +866,7 @@ async def send_translated_file_safe(message: Message, output_path: str, caption:
         )
         return created_temp_files
 
-    # 3. Если даже сжатый ZIP > 49 МБ — разбиваем на многотомные части (.part001, .part002...)
-    chunk_size = 45 * 1024 * 1024  # 45 МБ на каждый том
+    chunk_size = 45 * 1024 * 1024
     part_paths = []
     with open(zip_path, 'rb') as f:
         part_num = 1
@@ -653,7 +882,7 @@ async def send_translated_file_safe(message: Message, output_path: str, caption:
             part_num += 1
 
     await message.answer(
-        f"📦 Итоговый документ весит {file_size / (1024*1024):.1f} МБ (превышает лимит Telegram 50 МБ).\n"
+        f"📦 Итоговый документ весит {file_size / (1024 * 1024):.1f} МБ (превышает лимит Telegram 50 МБ).\n"
         f"Отправляю его в виде {len(part_paths)} частей архива. Чтобы открыть файл, скачайте все части в одну папку и распакуйте через 7-Zip / WinRAR."
     )
 
@@ -667,7 +896,7 @@ async def send_translated_file_safe(message: Message, output_path: str, caption:
 # ==================== ОБРАБОТКА ФАЙЛОВ ====================
 def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     wb = openpyxl.load_workbook(input_file)
-    
+
     cells_to_process = []
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
@@ -698,7 +927,7 @@ def process_excel_file_sync_with_progress(input_file, direction, bot: Bot, chat_
         batch = cells_to_process[i:i + batch_size]
         texts = [item[1] for item in batch]
         translated_texts = batch_translate_texts(texts, direction)
-        
+
         for (cell, _), trans in zip(batch, translated_texts):
             cell.alignment = openpyxl.styles.Alignment(wrap_text=True, vertical='top')
             if trans and trans != cell.value:
@@ -772,17 +1001,26 @@ def batch_translate_with_progress(items_list, direction, bot: Bot, chat_id: int,
 
 
 def get_xml_paragraph_text(p_elem):
-    """Собирает весь текст внутри XML-элемента <w:p> целиком, не разрывая слова."""
-    texts = []
-    for t in p_elem.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
-        if t.text:
-            texts.append(t.text)
-    return "".join(texts)
+    """
+    Собирает весь текст внутри XML-элемента <w:p> целиком, сохраняя пробелы и переносы строк.
+    Не разрывает слова на отдельные XML-теги <w:t>.
+    """
+    ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    parts = []
+    for elem in p_elem.iter():
+        if elem.tag == f'{ns}t' and elem.text:
+            parts.append(elem.text)
+        elif elem.tag == f'{ns}tab':
+            parts.append(' ')
+        elif elem.tag in (f'{ns}br', f'{ns}cr'):
+            parts.append('\n')
+    return "".join(parts)
 
 
 def set_xml_paragraph_text(p_elem, new_text):
-    """Записывает переведенный текст в первый <w:t> параграфа, очищая дубликаты, с сохранением форматирования."""
-    t_elems = list(p_elem.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'))
+    """Записывает переведенный текст в первый <w:t> параграфа, очищая дубликаты, с сохранением шрифта и стиля."""
+    ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    t_elems = list(p_elem.iter(f'{ns}t'))
     if not t_elems:
         return
     t_elems[0].text = new_text
@@ -791,57 +1029,51 @@ def set_xml_paragraph_text(p_elem, new_text):
 
 
 def process_word_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
+    """
+    Перевод Word (.docx) на уровне целых параграфов (включая таблицы, текстовые блоки и колонтитулы).
+    Устраняет разрыв слов и склейку фраз в документах после pdf2docx или сложного форматирования.
+    """
     doc = Document(input_file)
-    
+
     items_to_translate = []
-    runs_to_update = []
+    p_elements = []
+    seen_p_ids = set()
 
-    for p in doc.paragraphs:
-        for r in p.runs:
-            txt = r.text.strip()
-            if txt:
-                runs_to_update.append(r)
-                items_to_translate.append({'text': txt, 'index': len(items_to_translate)})
+    for p_elem in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
+        elem_id = id(p_elem)
+        if elem_id in seen_p_ids:
+            continue
+        seen_p_ids.add(elem_id)
 
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    for r in p.runs:
-                        txt = r.text.strip()
-                        if txt:
-                            runs_to_update.append(r)
-                            items_to_translate.append({'text': txt, 'index': len(items_to_translate)})
+        full_text = get_xml_paragraph_text(p_elem).strip()
+        if full_text:
+            p_elements.append(p_elem)
+            items_to_translate.append({'text': full_text, 'index': len(items_to_translate)})
 
-    print(f"📝 Найдено текстовых блоков (runs) для перевода в Word: {len(items_to_translate)}")
+    for section in doc.sections:
+        for header_footer in [section.header, section.footer]:
+            if header_footer:
+                for p_elem in header_footer._element.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
+                    elem_id = id(p_elem)
+                    if elem_id in seen_p_ids:
+                        continue
+                    seen_p_ids.add(elem_id)
 
-    if not items_to_translate:
-        p_elements = []
-        for p_elem in doc.element.body.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
-            full_text = get_xml_paragraph_text(p_elem).strip()
-            if full_text:
-                p_elements.append(p_elem)
-                items_to_translate.append({'text': full_text, 'index': len(items_to_translate)})
-        
-        print(f"📝 Резервный метод: найдено XML-параграфов: {len(items_to_translate)}")
-        
-        translated_results = batch_translate_with_progress(
-            items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
-        )
-        
-        for idx, p_elem in enumerate(p_elements):
-            trans = translated_results[idx]
-            if trans:
-                set_xml_paragraph_text(p_elem, trans)
-    else:
-        translated_results = batch_translate_with_progress(
-            items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
-        )
-        
-        for idx, r in enumerate(runs_to_update):
-            trans = translated_results[idx]
-            if trans:
-                r.text = trans
+                    full_text = get_xml_paragraph_text(p_elem).strip()
+                    if full_text:
+                        p_elements.append(p_elem)
+                        items_to_translate.append({'text': full_text, 'index': len(items_to_translate)})
+
+    print(f"📝 Найдено целых параграфов для перевода в Word: {len(items_to_translate)}")
+
+    translated_results = batch_translate_with_progress(
+        items_to_translate, direction, bot, chat_id, message_id, main_loop, file_type_name="Word"
+    )
+
+    for idx, p_elem in enumerate(p_elements):
+        trans = translated_results[idx]
+        if trans:
+            set_xml_paragraph_text(p_elem, trans)
 
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
@@ -892,7 +1124,7 @@ def process_pptx_file_with_progress(input_file, direction, bot: Bot, chat_id: in
 def process_text_document_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
-    
+
     items_to_translate = []
     for idx, line in enumerate(lines):
         if line.strip():
@@ -925,13 +1157,15 @@ def process_text_document_file_with_progress(input_file, direction, bot: Bot, ch
 def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     dir_path, full_name = os.path.split(input_file)
     name, ext = os.path.splitext(full_name)
-    output_path = os.path.join(dir_path, f"{name}_RU.docx")
+    suffix = get_file_suffix(direction)
+    temp_docx_path = os.path.join(dir_path, f"{name}_temp_conv.docx")
+    output_path = os.path.join(dir_path, f"{name}{suffix}.docx")
 
     try:
         progress_text = (
-            f"📄 Конвертация PDF с сохранением таблиц и структуры...\n"
-            f"[░░░░░░░░░░] 0%\n"
-            f"Обработка документов..."
+            "📄 Конвертация PDF с сохранением таблиц и структуры...\n"
+            "[░░░░░░░░░░] 0%\n"
+            "Обработка документа..."
         )
         asyncio.run_coroutine_threadsafe(
             bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
@@ -943,14 +1177,18 @@ def process_pdf_file_with_progress(input_file, direction, bot: Bot, chat_id: int
     if Converter is not None:
         try:
             cv = Converter(input_file)
-            cv.convert(output_path, start=0, end=None)
+            cv.convert(temp_docx_path, start=0, end=None)
             cv.close()
-            res_path = process_word_file_with_progress(output_path, direction, bot, chat_id, message_id, main_loop)
-            if os.path.exists(output_path) and output_path != res_path:
-                os.remove(output_path)
-            return res_path
+            res_path = process_word_file_with_progress(temp_docx_path, direction, bot, chat_id, message_id, main_loop)
+            if os.path.exists(temp_docx_path) and temp_docx_path != res_path:
+                os.remove(temp_docx_path)
+            if res_path != output_path and os.path.exists(res_path):
+                os.replace(res_path, output_path)
+            return output_path
         except Exception as e:
             print(f"⚠️ Ошибка в pdf2docx режиме: {e}")
+            if os.path.exists(temp_docx_path):
+                os.remove(temp_docx_path)
 
     out_doc = Document()
     reader = PdfReader(input_file)
@@ -983,9 +1221,9 @@ def process_image_file_with_ocr(input_file, direction, bot: Bot, chat_id: int, m
 
     try:
         progress_text = (
-            f"🔍 Распознавание текста с изображения (OCR)...\n"
-            f"[░░░░░░░░░░] 0%\n"
-            f"Анализ графических элементов..."
+            "🔍 Распознавание текста с изображения (OCR)...\n"
+            "[░░░░░░░░░░] 0%\n"
+            "Анализ графических элементов..."
         )
         asyncio.run_coroutine_threadsafe(
             bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id),
@@ -1034,13 +1272,13 @@ def process_image_file_with_ocr(input_file, direction, bot: Bot, chat_id: int, m
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.writelines(translated_lines)
-        
+
     return output_path
 
 
 def process_single_file_with_progress(file_path, direction, bot: Bot, chat_id: int, message_id: int, main_loop):
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in ['.docx']:
+    if ext == '.docx':
         return process_word_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
     elif ext == '.pptx':
         return process_pptx_file_with_progress(file_path, direction, bot, chat_id, message_id, main_loop)
@@ -1070,8 +1308,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "Text/Markdown (.txt, .md, .csv), PDF (.pdf), Картинки (.png, .jpg, .jpeg с OCR).\n\n"
         "Выберите направление перевода:"
     )
-    
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇬🇧 EN → RU 🇷🇺", callback_data="dir_en_ru")],
         [InlineKeyboardButton(text="🌐 EN/ZH (Англ+Кит) → RU  🇷🇺", callback_data="dir_en_zh_ru")],
@@ -1079,7 +1316,7 @@ async def cmd_start(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="🇷🇺 RU → AZ 🇦🇿", callback_data="dir_ru_az")],
         [InlineKeyboardButton(text="🇦🇿 AZ → RU 🇷🇺", callback_data="dir_az_ru")]
     ])
-    
+
     if user_id in DEVELOPER_IDS:
         welcome_text += "\n\n👑 Обнаружен ID спец-доступа (VIP): для вас все переводы бесплатны!"
 
@@ -1089,40 +1326,23 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("dir_"))
 async def process_direction_callback(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "dir_en_zh_ru":
-        direction = "en_zh_ru"
-    elif callback.data == "dir_en_ru":
-        direction = "en_ru"
-    elif callback.data == "dir_ru_en":
-        direction = "ru_en"
-    elif callback.data == "dir_ru_az":
-        direction = "ru_az"
-    elif callback.data == "dir_az_ru":
-        direction = "az_ru"
-    else:
-        direction = "en_ru"
-        
+    dir_map = {
+        "dir_en_zh_ru": ("en_zh_ru", "EN/ZH → RU (Англ + Китайский в РФ)"),
+        "dir_en_ru": ("en_ru", "EN → RU"),
+        "dir_ru_en": ("ru_en", "RU → EN"),
+        "dir_ru_az": ("ru_az", "RU → AZ (Русский → Азербайджанский)"),
+        "dir_az_ru": ("az_ru", "AZ → RU (Азербайджанский → Русский)"),
+    }
+    direction, dir_name = dir_map.get(callback.data, ("en_ru", "EN → RU"))
+
     await state.update_data(direction=direction)
-    
+
     global CUSTOM_DICTIONARY
     CUSTOM_DICTIONARY = load_custom_dictionary(direction)
-    
-    if direction == "en_zh_ru":
-        dir_name = "EN/ZH → RU (Англ + Китайский в РФ)"
-    elif direction == "en_ru":
-        dir_name = "EN → RU"
-    elif direction == "ru_en":
-        dir_name = "RU → EN"
-    elif direction == "ru_az":
-        dir_name = "RU → AZ (Русский → Азербайджанский)"
-    elif direction == "az_ru":
-        dir_name = "AZ → RU (Азербайджанский → Русский)"
-    else:
-        dir_name = direction
-        
+
     await callback.message.edit_text(
         f"✅ Направление выбрано: {dir_name}.\n\n"
-        "Теперь отправьте мне пожалуйста файл или изображение для перевода. Я буду показывать прогресс выполнения!"
+        "Теперь отправьте мне файл или изображение для перевода. Я буду показывать прогресс выполнения!"
     )
     await state.set_state(TranslateStates.waiting_for_file)
     await callback.answer()
@@ -1156,7 +1376,7 @@ async def process_file_document(message: Message, state: FSMContext, bot: Bot):
             )
             file_info = await bot.get_file(document.file_id)
             downloaded_file = await bot.download_file(file_info.file_path)
-            
+
             temp_dir = Path("temp_downloads")
             temp_dir.mkdir(exist_ok=True)
             local_path = temp_dir / f"{uuid.uuid4()}_{file_name}"
@@ -1191,18 +1411,18 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
     status_msg = await message.answer("⏳ Оплата получена! Анализирую структуру файла...")
     output_path = None
     extra_temp_files = []
-    
+
     try:
         main_loop = asyncio.get_running_loop()
         ext = os.path.splitext(file_path)[1].lower()
         if ext in ['.xlsx', '.xls']:
             output_path = await asyncio.to_thread(
-                process_excel_file_sync_with_progress, 
+                process_excel_file_sync_with_progress,
                 file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
         else:
             output_path = await asyncio.to_thread(
-                process_single_file_with_progress, 
+                process_single_file_with_progress,
                 file_path, direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
 
@@ -1211,7 +1431,7 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
             output_path,
             caption="✅ Готово! Файл успешно переведен. Если снова понадобится помощь — обращайтесь! 😎"
         )
-        
+
     except Exception as e:
         await message.answer(f"❌ Ошибка при обработке файла: {e}")
     finally:
@@ -1225,20 +1445,20 @@ async def successful_payment_handler(message: Message, state: FSMContext, bot: B
             await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
         except Exception:
             pass
-    
+
     await state.clear()
 
 
 async def execute_translation(message: Message, bot: Bot, document, direction, state: FSMContext):
     status_msg = await message.answer("⏳ Скачиваю и анализирую файл...")
-    
+
     local_path = None
     output_path = None
     extra_temp_files = []
     try:
         file_info = await bot.get_file(document.file_id)
         downloaded_file = await bot.download_file(file_info.file_path)
-        
+
         temp_dir = Path("temp_downloads")
         temp_dir.mkdir(exist_ok=True)
         local_path = temp_dir / f"{uuid.uuid4()}_{document.file_name}"
@@ -1249,21 +1469,21 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
         ext = os.path.splitext(document.file_name)[1].lower()
         if ext in ['.xlsx', '.xls']:
             output_path = await asyncio.to_thread(
-                process_excel_file_sync_with_progress, 
+                process_excel_file_sync_with_progress,
                 str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
         else:
             output_path = await asyncio.to_thread(
-                process_single_file_with_progress, 
+                process_single_file_with_progress,
                 str(local_path), direction, bot, message.chat.id, status_msg.message_id, main_loop
             )
-        
+
         extra_temp_files = await send_translated_file_safe(
             message,
             output_path,
             caption="👑 Файл успешно переведен! Спасибо за ожидание 🤝."
         )
-            
+
     except Exception as e:
         import traceback
         print("❌ ОШИБКА ПЕРЕВОДА:\n", traceback.format_exc())
@@ -1279,7 +1499,7 @@ async def execute_translation(message: Message, bot: Bot, document, direction, s
             await bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
         except Exception:
             pass
-    
+
     await state.clear()
 
 
@@ -1291,7 +1511,7 @@ async def on_startup(bot: Bot):
             print("🗑️ Предыдущий вебхук успешно удален.")
         except Exception as e:
             print(f"⚠️ Ошибка при удалении вебхука: {e}")
-            
+
         await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
         print(f"🔗 Вебхук успешно зарегистрирован в Telegram: {WEBHOOK_URL}")
     else:
